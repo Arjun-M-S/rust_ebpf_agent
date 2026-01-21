@@ -1,17 +1,17 @@
 [package]
 name = "edr-agent-ebpf"
 version = "0.1.0"
-edition.workspace = true
+edition = "2021"
+publish = false
 
 [dependencies]
-edr-agent-common = { path = "../edr-agent-common" }
-
+edr-agent-common = { path = "../edr-agent-common", features = ["kernel"] }
 aya-ebpf = { workspace = true }
 aya-log-ebpf = { workspace = true }
 
+[[bin]]
+name = "edr-agent-ebpf"
+path = "src/main.rs"
+
 [build-dependencies]
 which = { workspace = true }
-
-[[bin]]
-name = "edr-agent"
-path = "src/main.rs"

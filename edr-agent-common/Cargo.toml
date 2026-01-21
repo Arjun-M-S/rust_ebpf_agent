@@ -1,16 +1,14 @@
 [package]
 name = "edr-agent-common"
 version = "0.1.0"
-edition.workspace = true
+edition = "2021"
+publish = false
 
-license.workspace = true
+[dependencies]
+# We need serde only for the User Space side
+serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
 default = []
-user = ["aya"]
-
-[dependencies]
-aya = { workspace = true, optional = true }
-
-[lib]
-path = "src/lib.rs"
+user = ["serde"]
+kernel = []

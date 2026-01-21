@@ -1,27 +1,48 @@
-use anyhow::{Context as _, anyhow};
-use aya_build::Toolchain;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
 
-fn main() -> anyhow::Result<()> {
-    let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()
-        .no_deps()
-        .exec()
-        .context("MetadataCommand::exec")?;
-    let ebpf_package = packages
-        .into_iter()
-        .find(|cargo_metadata::Package { name, .. }| name.as_str() == "edr-agent-ebpf")
-        .ok_or_else(|| anyhow!("edr-agent-ebpf package not found"))?;
-    let cargo_metadata::Package {
-        name,
-        manifest_path,
-        ..
-    } = ebpf_package;
-    let ebpf_package = aya_build::Package {
-        name: name.as_str(),
-        root_dir: manifest_path
-            .parent()
-            .ok_or_else(|| anyhow!("no parent for {manifest_path}"))?
-            .as_str(),
-        ..Default::default()
-    };
-    aya_build::build_ebpf([ebpf_package], Toolchain::default())
+fn main() {
+    println!("cargo:rerun-if-changed=../edr-agent-ebpf");
+
+    // 1. Determine paths
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let workspace_root = PathBuf::from("..").canonicalize().unwrap();
+    
+    // 2. Build the eBPF Kernel (Manual Cargo Command)
+    // We force --release because eBPF requires optimizations to work correctly
+    let status = Command::new("cargo")
+        .current_dir(&workspace_root)
+        .args(&[
+            "build",
+            "--package", "edr-agent-ebpf",
+            "--target", "bpfel-unknown-none",
+            "-Z", "build-std=core",
+            "--release" 
+        ])
+        .status()
+        .expect("Failed to run cargo build for eBPF");
+
+    if !status.success() {
+        panic!("Failed to build eBPF program");
+    }
+
+    // 3. Locate the compiled binary (Standard Rust location)
+    let bpf_binary = workspace_root
+        .join("target/bpfel-unknown-none/release/edr-agent-ebpf");
+
+    // 4. Copy it to the build output directory so we can access it easily
+    let dest_path = out_dir.join("edr-agent-ebpf");
+    
+    // FORCE CLEANUP: This fixes your "Is a directory" error
+    if dest_path.exists() {
+        if dest_path.is_dir() {
+            fs::remove_dir_all(&dest_path).unwrap();
+        } else {
+            fs::remove_file(&dest_path).unwrap();
+        }
+    }
+
+    fs::copy(&bpf_binary, &dest_path).expect("Failed to copy eBPF binary");
 }
