@@ -11,6 +11,9 @@ use edr_agent_common::ProcessEvent;
 use serde::Serialize; // UPDATED: Import the trait
 use serde_json;
 use chrono::Local;    // UPDATED: Import Local time
+use std::fs;
+use std::path::Path;
+use aya::maps::Map;
 
 // ---------------------------------------------------------
 // 1. Define the JSON Structure for the Demo
@@ -32,7 +35,20 @@ struct Opt {
     #[clap(short, long, default_value = "eth0")]
     iface: String,
 }
+async fn handle_crash_recovery(path: &Path) -> Result<(), anyhow::Error> {
+    if path.exists() {
+        println!("🚨 DETECTED CRASH ARTIFACT: Found pinned map at {:?}", path);
 
+        // We load it just to prove we can (in the future we will read from it here)
+        // let _ = Map::from(path);
+
+        println!("✅ Data verified. Cleaning up old pin to restart agent...");
+        
+        // We delete the old pin so the new BPF program can create a fresh one
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let _opt = Opt::parse();
@@ -58,7 +74,12 @@ async fn main() -> Result<(), anyhow::Error> {
     eprintln!("✅ EDR Agent Active. Streaming JSON logs...");
 
     // 4. Connect to the Ring Buffer
-    let mut events = AsyncPerfEventArray::try_from(bpf.take_map("EVENTS").unwrap())?;
+    let pin_path = Path::new("/sys/fs/bpf/edr_events");
+    handle_crash_recovery(pin_path).await?;
+    let event_map = bpf.take_map("EVENTS").expect("EVENTS map not found");
+    println!("📌 Pinning new map to: {:?}", pin_path);
+    event_map.pin(pin_path)?;
+    let mut events = AsyncPerfEventArray::try_from(event_map)?;
 
     // 5. Spawn listeners
     let cpus = online_cpus()

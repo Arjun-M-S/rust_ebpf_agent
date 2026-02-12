@@ -1,43 +1,9 @@
-   Compiling edr-agent v0.1.0 (/home/arjunms/edr-agent/edr-agent)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.06s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
      Running `sudo -E target/debug/edr-agent`
 ✅ EDR Agent Active. Streaming JSON logs...
-{"timestamp":"2026-02-03T21:03:34.976710883+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17400,"ppid":2324,"process_name":"gio-launch-desk","causal_hash":"sha256(2324:17400)"}
-{"timestamp":"2026-02-03T21:03:34.977693257+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17400,"ppid":2324,"process_name":"x-terminal-emul","causal_hash":"sha256(2324:17400)"}
-{"timestamp":"2026-02-03T21:03:34.983915695+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17400,"ppid":2324,"process_name":"gnome-terminal","causal_hash":"sha256(2324:17400)"}
-{"timestamp":"2026-02-03T21:03:35.028918686+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17403,"ppid":17400,"process_name":"gnome-terminal.","causal_hash":"sha256(17400:17403)"}
-{"timestamp":"2026-02-03T21:03:35.119481881+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17409,"ppid":14017,"process_name":"bash","causal_hash":"sha256(14017:17409)"}
-{"timestamp":"2026-02-03T21:03:35.121935369+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17411,"ppid":17409,"process_name":"lesspipe","causal_hash":"sha256(17409:17411)"}
-{"timestamp":"2026-02-03T21:03:35.123185162+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17412,"ppid":17411,"process_name":"basename","causal_hash":"sha256(17411:17412)"}
-{"timestamp":"2026-02-03T21:03:35.125656465+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17414,"ppid":17413,"process_name":"dirname","causal_hash":"sha256(17413:17414)"}
-{"timestamp":"2026-02-03T21:03:35.128376259+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17415,"ppid":17409,"process_name":"dircolors","causal_hash":"sha256(17409:17415)"}
-{"timestamp":"2026-02-03T21:03:45.225254603+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17416,"ppid":17409,"process_name":"ls","causal_hash":"sha256(17409:17416)"}
-{"timestamp":"2026-02-03T21:04:08.687134842+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17424,"ppid":17409,"process_name":"bash","causal_hash":"sha256(17409:17424)"}
-{"timestamp":"2026-02-03T21:04:08.690755565+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17425,"ppid":17424,"process_name":"lesspipe","causal_hash":"sha256(17424:17425)"}
-{"timestamp":"2026-02-03T21:04:08.690947019+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17426,"ppid":17425,"process_name":"basename","causal_hash":"sha256(17425:17426)"}
-{"timestamp":"2026-02-03T21:04:08.692267439+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17428,"ppid":17427,"process_name":"dirname","causal_hash":"sha256(17427:17428)"}
-{"timestamp":"2026-02-03T21:04:08.693853029+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17429,"ppid":17424,"process_name":"dircolors","causal_hash":"sha256(17424:17429)"}
-{"timestamp":"2026-02-03T21:04:26.674931314+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17430,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17430)"}
-{"timestamp":"2026-02-03T21:04:26.680993683+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17431,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17431)"}
-{"timestamp":"2026-02-03T21:04:26.688053145+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17432,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17432)"}
-{"timestamp":"2026-02-03T21:04:26.690882714+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17433,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17433)"}
-{"timestamp":"2026-02-03T21:04:27.054784319+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17435,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17435)"}
-{"timestamp":"2026-02-03T21:04:27.059893201+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17436,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17436)"}
-{"timestamp":"2026-02-03T21:04:27.070359881+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17437,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17437)"}
-{"timestamp":"2026-02-03T21:04:30.483560590+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17439,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17439)"}
-{"timestamp":"2026-02-03T21:04:31.704913066+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17440,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17440)"}
-{"timestamp":"2026-02-03T21:04:31.709280659+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17441,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17441)"}
-{"timestamp":"2026-02-03T21:04:31.715775073+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17442,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17442)"}
-{"timestamp":"2026-02-03T21:04:31.719851604+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17443,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17443)"}
-{"timestamp":"2026-02-03T21:04:36.733143003+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17444,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17444)"}
-{"timestamp":"2026-02-03T21:04:36.736306509+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17445,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17445)"}
-{"timestamp":"2026-02-03T21:04:36.739881219+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17446,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17446)"}
-{"timestamp":"2026-02-03T21:04:36.743859658+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17447,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17447)"}
-{"timestamp":"2026-02-03T21:04:41.754773532+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17448,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17448)"}
-{"timestamp":"2026-02-03T21:04:41.760228200+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17449,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17449)"}
-{"timestamp":"2026-02-03T21:04:41.765579224+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17450,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17450)"}
-{"timestamp":"2026-02-03T21:04:41.769566458+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17451,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17451)"}
-{"timestamp":"2026-02-03T21:04:46.780528933+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17452,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17452)"}
-{"timestamp":"2026-02-03T21:04:46.784796239+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17453,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17453)"}
-{"timestamp":"2026-02-03T21:04:46.789188984+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17454,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17454)"}
-{"timestamp":"2026-02-03T21:04:46.792202885+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":17455,"ppid":14700,"process_name":"git","causal_hash":"sha256(14700:17455)"}
+{"timestamp":"2026-02-04T15:32:34.649046131+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":3821,"ppid":3659,"process_name":"ls","causal_hash":"sha256(3659:3821)"}
+{"timestamp":"2026-02-04T15:33:00.613585268+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":3822,"ppid":3659,"process_name":"bash","causal_hash":"sha256(3659:3822)"}
+{"timestamp":"2026-02-04T15:33:00.617849376+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":3823,"ppid":3822,"process_name":"lesspipe","causal_hash":"sha256(3822:3823)"}
+{"timestamp":"2026-02-04T15:33:00.619727236+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":3824,"ppid":3823,"process_name":"basename","causal_hash":"sha256(3823:3824)"}
+{"timestamp":"2026-02-04T15:33:00.622610333+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":3826,"ppid":3825,"process_name":"dirname","causal_hash":"sha256(3825:3826)"}
+{"timestamp":"2026-02-04T15:33:00.626402196+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":3827,"ppid":3822,"process_name":"dircolors","causal_hash":"sha256(3822:3827)"}
