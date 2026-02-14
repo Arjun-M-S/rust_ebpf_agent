@@ -7,7 +7,6 @@ publish = false
 [dependencies]
 # Internal
 edr-agent-common = { path = "../edr-agent-common", features = ["user"] }
-
 # Aya (Stable uses 'async_tokio')
 aya = { workspace = true, features = ["async_tokio"] }
 aya-log = { workspace = true }
@@ -19,7 +18,7 @@ clap = { workspace = true, features = ["derive"] }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "signal"] }
+tokio = { workspace = true, features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }

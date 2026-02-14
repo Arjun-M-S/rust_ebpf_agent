@@ -1,7 +1,6 @@
 #![no_std]
 #![no_main]
 
-// THE MAGIC MODULE IS HERE
 #[allow(non_upper_case_globals)]
 #[allow(non_snake_case)]
 #[allow(non_camel_case_types)]
@@ -9,12 +8,11 @@
 mod vmlinux;
 
 use vmlinux::task_struct;
-
 use aya_ebpf::{
     macros::{map, tracepoint},
     programs::TracePointContext,
     maps::PerfEventArray,
-    helpers::{bpf_get_current_pid_tgid, bpf_get_current_comm, bpf_get_current_task_btf},
+    helpers::{bpf_get_current_pid_tgid, bpf_get_current_comm, bpf_get_current_task_btf, bpf_probe_read_kernel},
 };
 use edr_agent_common::ProcessEvent;
 
@@ -36,12 +34,16 @@ fn try_edr_agent(ctx: TracePointContext) -> Result<u32, u32> {
     // 1. Get the Task Struct
     let task = unsafe { bpf_get_current_task_btf() as *const task_struct };
     
-    // 2. Read the Real Parent PID (No Mocking!)
+    // 2. Read the Real Parent PID (SAFE VERSION)
     let ppid = unsafe {
         if !task.is_null() {
-            let parent = (*task).real_parent;
-            if !parent.is_null() {
-                (*parent).tgid as u32
+            // FIX: Use null_mut() because the kernel struct uses mutable pointers
+            let parent_ptr: *mut task_struct = 
+                bpf_probe_read_kernel(&(*task).real_parent).unwrap_or(core::ptr::null_mut());
+
+            if !parent_ptr.is_null() {
+                // Force read the PID from that pointer
+                bpf_probe_read_kernel(&(*parent_ptr).tgid).unwrap_or(0)
             } else {
                 0
             }
@@ -52,7 +54,7 @@ fn try_edr_agent(ctx: TracePointContext) -> Result<u32, u32> {
 
     let event = ProcessEvent {
         pid: pid,
-        ppid: ppid, // 100% Real Data
+        ppid: ppid as u32,
         cmd: comm,
     };
 
@@ -65,7 +67,3 @@ fn try_edr_agent(ctx: TracePointContext) -> Result<u32, u32> {
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
-
-#[unsafe(link_section = "license")]
-#[unsafe(no_mangle)]
-static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";
