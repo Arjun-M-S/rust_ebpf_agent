@@ -12,7 +12,14 @@ use aya_ebpf::{
     macros::{map, tracepoint},
     programs::TracePointContext,
     maps::PerfEventArray,
-    helpers::{bpf_get_current_pid_tgid, bpf_get_current_comm, bpf_get_current_task_btf, bpf_probe_read_kernel},
+};
+use aya_ebpf::helpers::{
+    bpf_get_current_pid_tgid, 
+    bpf_get_current_comm, 
+    bpf_get_current_task_btf, 
+    bpf_probe_read_kernel,
+    bpf_probe_read_kernel_buf, // <-- Needed to read arrays safely
+    bpf_get_current_uid_gid    // <-- Needed for Day 1
 };
 use edr_agent_common::ProcessEvent;
 
@@ -31,18 +38,28 @@ fn try_edr_agent(ctx: TracePointContext) -> Result<u32, u32> {
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let comm = bpf_get_current_comm().unwrap_or([0; 16]);
 
-    // 1. Get the Task Struct
+    // DAY 1: Get the User ID
+    let uid_gid = unsafe { bpf_get_current_uid_gid() };
+    let uid = uid_gid as u32;
+
     let task = unsafe { bpf_get_current_task_btf() as *const task_struct };
     
-    // 2. Read the Real Parent PID (SAFE VERSION)
+    // DAY 2: Prepare a buffer for the parent's name
+    let mut pcomm = [0u8; 16];
+    
+    // Read the Real Parent PID and Name safely
     let ppid = unsafe {
         if !task.is_null() {
-            // FIX: Use null_mut() because the kernel struct uses mutable pointers
             let parent_ptr: *mut task_struct = 
                 bpf_probe_read_kernel(&(*task).real_parent).unwrap_or(core::ptr::null_mut());
-
             if !parent_ptr.is_null() {
-                // Force read the PID from that pointer
+                // THE FIX IS HERE: Cast the pointer explicitly
+                let _ = bpf_probe_read_kernel_buf(
+                    &(*parent_ptr).comm as *const _ as *const u8, 
+                    &mut pcomm
+                );
+                
+                // Read the parent's PID
                 bpf_probe_read_kernel(&(*parent_ptr).tgid).unwrap_or(0)
             } else {
                 0
@@ -55,7 +72,9 @@ fn try_edr_agent(ctx: TracePointContext) -> Result<u32, u32> {
     let event = ProcessEvent {
         pid: pid,
         ppid: ppid as u32,
+        uid: uid,         // <-- ADDED
         cmd: comm,
+        pcomm: pcomm,// The new parent name
     };
 
     EVENTS.output(&ctx, &event, 0);

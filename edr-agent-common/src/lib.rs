@@ -1,12 +1,11 @@
 #![no_std]
 
-// We use `cfg_attr` to say: 
-// "Only derive Serialize and Deserialize IF the 'user' feature is enabled."
-#[derive(Debug, Clone, Copy)]
 #[repr(C)]
-#[cfg_attr(feature = "user", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy)]
 pub struct ProcessEvent {
     pub pid: u32,
     pub ppid: u32,
-    pub cmd: [u8; 16],
+    pub uid: u32,         // DAY 1: Who ran it?
+    pub cmd: [u8; 16],    // The command
+    pub pcomm: [u8; 16],  // DAY 2: What spawned it?
 }

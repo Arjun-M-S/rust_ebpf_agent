@@ -25,12 +25,13 @@ struct AgentLog {
     timestamp: String,
     severity: String,
     event_type: String,
+    uid: u32,                  // Day 1
     pid: u32,
     ppid: u32,
     process_name: String,
+    parent_process_name: String, // Day 2
     causal_hash: String, 
 }
-
 #[derive(Debug, Parser)]
 struct Opt {
     #[clap(short, long, default_value = "eth0")]
@@ -144,14 +145,17 @@ async fn main() -> Result<(), anyhow::Error> {
 
                     let len = data.cmd.iter().position(|&c| c == 0).unwrap_or(16);
                     let cmd = std::str::from_utf8(&data.cmd[..len]).unwrap_or("<unknown>");
-
+                    let p_len = data.pcomm.iter().position(|&c| c == 0).unwrap_or(16);
+                    let pcomm_str = std::str::from_utf8(&data.pcomm[..p_len]).unwrap_or("<unknown>");
                     let log_entry = AgentLog {
                         timestamp: Local::now().to_rfc3339(),
                         severity: "INFO".to_string(),
                         event_type: "PROCESS_EXEC".to_string(),
+                        uid: data.uid,
                         pid: data.pid,
                         ppid: data.ppid, 
                         process_name: cmd.to_string(),
+                        parent_process_name: pcomm_str.to_string(), // Add this!
                         causal_hash: format!("sha256({}:{})", data.ppid, data.pid),
                     };
 
