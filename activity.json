@@ -1,9 +1,0 @@
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
-     Running `sudo -E target/debug/edr-agent`
-✅ EDR Agent Active. Streaming JSON logs...
-{"timestamp":"2026-02-04T15:32:34.649046131+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":3821,"ppid":3659,"process_name":"ls","causal_hash":"sha256(3659:3821)"}
-{"timestamp":"2026-02-04T15:33:00.613585268+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":3822,"ppid":3659,"process_name":"bash","causal_hash":"sha256(3659:3822)"}
-{"timestamp":"2026-02-04T15:33:00.617849376+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":3823,"ppid":3822,"process_name":"lesspipe","causal_hash":"sha256(3822:3823)"}
-{"timestamp":"2026-02-04T15:33:00.619727236+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":3824,"ppid":3823,"process_name":"basename","causal_hash":"sha256(3823:3824)"}
-{"timestamp":"2026-02-04T15:33:00.622610333+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":3826,"ppid":3825,"process_name":"dirname","causal_hash":"sha256(3825:3826)"}
-{"timestamp":"2026-02-04T15:33:00.626402196+05:30","severity":"INFO","event_type":"PROCESS_EXEC","pid":3827,"ppid":3822,"process_name":"dircolors","causal_hash":"sha256(3822:3827)"}

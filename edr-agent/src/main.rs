@@ -16,6 +16,7 @@ use std::path::Path;
 use aya::maps::Map;
 use tokio::sync::mpsc;
 use tokio::io::AsyncWriteExt; // Needed for file writing
+use sha2::{Sha256, Digest};   // NEW: Needed for the Tamper-Evident Chain
 
 // ---------------------------------------------------------
 // 1. Define the JSON Structure
@@ -25,13 +26,16 @@ struct AgentLog {
     timestamp: String,
     severity: String,
     event_type: String,
-    uid: u32,                  // Day 1
+    uid: u32,
     pid: u32,
     ppid: u32,
     process_name: String,
-    parent_process_name: String, // Day 2
-    causal_hash: String, 
+    parent_process_name: String,
+    // THE CRYPTO FIELDS
+    prev_hash: String, 
+    hash: String,      
 }
+
 #[derive(Debug, Parser)]
 struct Opt {
     #[clap(short, long, default_value = "eth0")]
@@ -59,7 +63,6 @@ async fn main() -> Result<(), anyhow::Error> {
     // ---------------------------------------------------------
     // 3. SETUP WAL (Failsafe)
     // ---------------------------------------------------------
-    // TYPO FIXED: Changed /tml to /tmp
     let mut wal_file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -71,7 +74,31 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Spawn the Consumer (Logger) Task
     tokio::spawn(async move {
-        while let Some(log) = rx.recv().await {
+        // 1. Initialize the "Genesis Hash" (Start of the chain)
+        let mut last_hash = String::from("0000000000000000000000000000000000000000000000000000000000000000");
+
+        // NOTE: We made `log` mutable here so we can update the hash fields
+        while let Some(mut log) = rx.recv().await {
+            
+            // 2. Attach the previous hash to the current log
+            log.prev_hash = last_hash.clone();
+
+            // 3. Create the cryptographic payload (Data + Prev Hash)
+            let data_to_hash = format!(
+                "{}{}{}{}{}", 
+                log.timestamp, log.uid, log.pid, log.process_name, log.prev_hash
+            );
+
+            // 4. Calculate the SHA256 Hash
+            let mut hasher = Sha256::new();
+            hasher.update(data_to_hash.as_bytes());
+            let current_hash = hex::encode(hasher.finalize());
+
+            // 5. Lock in the current hash and update state for the next loop
+            log.hash = current_hash.clone();
+            last_hash = current_hash; 
+
+            // 6. Serialize the final cryptographically sealed log
             let json = serde_json::to_string(&log).unwrap();
 
             // A. Write to Disk (The Failsafe)
@@ -145,8 +172,10 @@ async fn main() -> Result<(), anyhow::Error> {
 
                     let len = data.cmd.iter().position(|&c| c == 0).unwrap_or(16);
                     let cmd = std::str::from_utf8(&data.cmd[..len]).unwrap_or("<unknown>");
+                    
                     let p_len = data.pcomm.iter().position(|&c| c == 0).unwrap_or(16);
                     let pcomm_str = std::str::from_utf8(&data.pcomm[..p_len]).unwrap_or("<unknown>");
+                    
                     let log_entry = AgentLog {
                         timestamp: Local::now().to_rfc3339(),
                         severity: "INFO".to_string(),
@@ -155,8 +184,12 @@ async fn main() -> Result<(), anyhow::Error> {
                         pid: data.pid,
                         ppid: data.ppid, 
                         process_name: cmd.to_string(),
-                        parent_process_name: pcomm_str.to_string(), // Add this!
-                        causal_hash: format!("sha256({}:{})", data.ppid, data.pid),
+                        parent_process_name: pcomm_str.to_string(),
+                        
+                        // We leave these blank. The Consumer Thread calculates 
+                        // them safely to prevent Race Conditions!
+                        prev_hash: String::new(),
+                        hash: String::new(),
                     };
 
                     // Send to the Logger Channel instead of printing directly
