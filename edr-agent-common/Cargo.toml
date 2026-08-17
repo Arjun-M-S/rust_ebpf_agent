@@ -5,10 +5,14 @@ edition = "2021"
 publish = false
 
 [dependencies]
-# We need serde only for the User Space side
+# All userspace-only. The eBPF crate builds with default features and must not
+# pull any of these into a no_std target.
 serde = { version = "1", features = ["derive"], optional = true }
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
 
 [features]
 default = []
-user = ["serde"]
+user = ["serde", "hmac", "sha2", "hex"]
 kernel = []

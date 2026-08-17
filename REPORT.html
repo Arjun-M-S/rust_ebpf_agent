@@ -1,0 +1,1117 @@
+<title>Sealing the Chain</title>
+<style>
+  /* ---------------------------------------------------------------
+     Palette: prussian-blue accent (technical drawing, blueprint),
+     neutrals biased cool to sit with it. Semantic severity colours
+     are deliberately separate from the accent.
+     --------------------------------------------------------------- */
+  :root {
+    --paper:      #F5F6F8;
+    --card:       #FFFFFF;
+    --ink:        #131820;
+    --ink-soft:   #3D4756;
+    --muted:      #6A7484;
+    --rule:       #DBE0E7;
+    --rule-soft:  #E8ECF1;
+    --accent:     #1F4E79;
+    --accent-dim: #E3EAF2;
+    --crit:       #A61B29;
+    --crit-bg:    #F7E4E6;
+    --warn:       #8A5D12;
+    --warn-bg:    #F7EEDD;
+    --ok:         #26614A;
+    --ok-bg:      #E0EFE8;
+    --code-bg:    #EFF2F5;
+    --shadow:     0 1px 2px rgba(19,24,32,.05), 0 8px 24px -12px rgba(19,24,32,.18);
+
+    --serif: Georgia, 'Iowan Old Style', 'Palatino Linotype', ui-serif, serif;
+    --mono:  ui-monospace, 'SF Mono', 'Cascadia Mono', 'Roboto Mono', Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper:      #0F131A;
+      --card:       #161C25;
+      --ink:        #E6EAF0;
+      --ink-soft:   #BAC4D2;
+      --muted:      #8290A2;
+      --rule:       #262F3B;
+      --rule-soft:  #1E2731;
+      --accent:     #7FB0DC;
+      --accent-dim: #1B2836;
+      --crit:       #E8858E;
+      --crit-bg:    #2E1A1E;
+      --warn:       #D9AB5C;
+      --warn-bg:    #2C2418;
+      --ok:         #74BE9B;
+      --ok-bg:      #16281F;
+      --code-bg:    #1A212B;
+      --shadow:     0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.7);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --paper:      #0F131A;
+    --card:       #161C25;
+    --ink:        #E6EAF0;
+    --ink-soft:   #BAC4D2;
+    --muted:      #8290A2;
+    --rule:       #262F3B;
+    --rule-soft:  #1E2731;
+    --accent:     #7FB0DC;
+    --accent-dim: #1B2836;
+    --crit:       #E8858E;
+    --crit-bg:    #2E1A1E;
+    --warn:       #D9AB5C;
+    --warn-bg:    #2C2418;
+    --ok:         #74BE9B;
+    --ok-bg:      #16281F;
+    --code-bg:    #1A212B;
+    --shadow:     0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.7);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--serif);
+    font-size: 17px;
+    line-height: 1.62;
+    margin: 0;
+    padding: 0 1.25rem 6rem;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 46rem; margin: 0 auto; }
+
+  /* ---------- masthead ---------- */
+  header.masthead {
+    padding: 4.5rem 0 2rem;
+    border-bottom: 2px solid var(--ink);
+    margin-bottom: 2.5rem;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: .68rem;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 1.4rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem 1rem;
+  }
+  h1 {
+    font-size: clamp(2.1rem, 6vw, 3.1rem);
+    line-height: 1.08;
+    letter-spacing: -.02em;
+    font-weight: 700;
+    text-wrap: balance;
+    margin: 0 0 .9rem;
+  }
+  .subtitle {
+    font-size: 1.18rem;
+    color: var(--ink-soft);
+    font-style: italic;
+    text-wrap: balance;
+    margin: 0 0 2rem;
+  }
+  .byline {
+    font-family: var(--mono);
+    font-size: .74rem;
+    color: var(--muted);
+    line-height: 1.9;
+    display: grid;
+    grid-template-columns: 7.5rem 1fr;
+    gap: 0 1rem;
+  }
+  .byline dt { color: var(--muted); }
+  .byline dd { margin: 0; color: var(--ink-soft); }
+
+  /* ---------- sections ---------- */
+  section { margin: 0 0 3.5rem; }
+  h2 {
+    font-size: 1.6rem;
+    line-height: 1.2;
+    letter-spacing: -.015em;
+    margin: 3.5rem 0 1.1rem;
+    padding-top: 1.6rem;
+    border-top: 1px solid var(--rule);
+    text-wrap: balance;
+  }
+  h2 .num {
+    font-family: var(--mono);
+    font-size: .78rem;
+    font-weight: 400;
+    color: var(--accent);
+    display: block;
+    letter-spacing: .1em;
+    margin-bottom: .55rem;
+  }
+  h3 {
+    font-size: 1.1rem;
+    letter-spacing: -.005em;
+    margin: 2.2rem 0 .6rem;
+    text-wrap: balance;
+  }
+  h3 .num {
+    font-family: var(--mono);
+    font-size: .82rem;
+    font-weight: 400;
+    color: var(--muted);
+    margin-right: .5rem;
+  }
+  p { margin: 0 0 1.1rem; }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+
+  .lede {
+    font-size: 1.12rem;
+    color: var(--ink-soft);
+  }
+
+  ul, ol { margin: 0 0 1.2rem; padding-left: 1.3rem; }
+  li { margin-bottom: .5rem; }
+  li::marker { color: var(--muted); }
+
+  code {
+    font-family: var(--mono);
+    font-size: .84em;
+    background: var(--code-bg);
+    padding: .1em .35em;
+    border-radius: 3px;
+  }
+
+  /* ---------- figures ---------- */
+  figure {
+    margin: 2rem 0;
+    background: var(--card);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  figcaption {
+    font-family: var(--mono);
+    font-size: .71rem;
+    line-height: 1.65;
+    color: var(--muted);
+    padding: .8rem 1.1rem;
+    border-top: 1px solid var(--rule-soft);
+    background: var(--paper);
+  }
+  figcaption b {
+    color: var(--ink-soft);
+    font-weight: 400;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    font-size: .93em;
+  }
+
+  pre {
+    margin: 0;
+    padding: 1.1rem 1.2rem;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: .79rem;
+    line-height: 1.7;
+    color: var(--ink-soft);
+    background: var(--card);
+    tab-size: 2;
+  }
+  pre code { background: none; padding: 0; font-size: 1em; }
+  .cm { color: var(--muted); }
+  .bad { color: var(--crit); font-weight: 700; }
+  .good { color: var(--ok); font-weight: 700; }
+
+  /* two-up before/after */
+  .compare {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1px;
+    background: var(--rule);
+  }
+  @media (min-width: 42rem) { .compare { grid-template-columns: 1fr 1fr; } }
+  .compare > div { background: var(--card); }
+  .lbl {
+    font-family: var(--mono);
+    font-size: .66rem;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    padding: .6rem 1.2rem;
+    border-bottom: 1px solid var(--rule-soft);
+    color: var(--muted);
+  }
+  .lbl.before { color: var(--crit); }
+  .lbl.after  { color: var(--ok); }
+
+  /* ---------- finding tags ---------- */
+  .fid {
+    font-family: var(--mono);
+    font-size: .74em;
+    font-weight: 700;
+    letter-spacing: .04em;
+    color: var(--accent);
+    background: var(--accent-dim);
+    padding: .12em .42em;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+
+  .sev {
+    font-family: var(--mono);
+    font-size: .62rem;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: .18em .5em;
+    border-radius: 2px;
+    white-space: nowrap;
+    font-weight: 700;
+  }
+  .sev.c { color: var(--crit); background: var(--crit-bg); }
+  .sev.h { color: var(--warn); background: var(--warn-bg); }
+  .sev.f { color: var(--ok);   background: var(--ok-bg); }
+
+  /* ---------- tables ---------- */
+  .tbl-scroll { overflow-x: auto; margin: 1.8rem 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: .85rem;
+    font-variant-numeric: tabular-nums;
+    min-width: 30rem;
+  }
+  th {
+    text-align: left;
+    font-family: var(--mono);
+    font-size: .64rem;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 400;
+    padding: 0 .8rem .6rem 0;
+    border-bottom: 1px solid var(--ink);
+    vertical-align: bottom;
+  }
+  td {
+    padding: .65rem .8rem .65rem 0;
+    border-bottom: 1px solid var(--rule-soft);
+    vertical-align: top;
+    color: var(--ink-soft);
+  }
+  td:last-child, th:last-child { padding-right: 0; }
+  .num-cell { font-family: var(--mono); font-weight: 700; color: var(--ink); }
+
+  /* ---------- callout ---------- */
+  .note {
+    border-left: 3px solid var(--accent);
+    background: var(--card);
+    padding: 1.1rem 1.3rem;
+    margin: 2rem 0;
+    border-radius: 0 4px 4px 0;
+    font-size: .94rem;
+  }
+  .note p:last-child { margin-bottom: 0; }
+  .note .hd {
+    font-family: var(--mono);
+    font-size: .66rem;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: .5rem;
+  }
+  .note.caution { border-left-color: var(--crit); }
+  .note.caution .hd { color: var(--crit); }
+
+  /* ---------- stat strip ---------- */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    margin: 2rem 0;
+    overflow: hidden;
+  }
+  .stat { background: var(--card); padding: 1rem 1.1rem; }
+  .stat .v {
+    font-family: var(--mono);
+    font-size: 1.55rem;
+    font-weight: 700;
+    color: var(--ink);
+    line-height: 1.1;
+    letter-spacing: -.02em;
+  }
+  .stat .k {
+    font-family: var(--mono);
+    font-size: .63rem;
+    letter-spacing: .11em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-top: .4rem;
+    line-height: 1.5;
+  }
+
+  /* ---------- svg diagram ---------- */
+  .diagram { padding: 1.6rem 1.2rem; background: var(--card); overflow-x: auto; }
+  .diagram svg { display: block; margin: 0 auto; min-width: 30rem; }
+  .d-label { font-family: var(--mono); font-size: 9.5px; letter-spacing: .06em; }
+  .d-title { font-family: var(--mono); font-size: 9px; letter-spacing: .13em; text-transform: uppercase; }
+  .d-box { fill: var(--card); stroke: var(--rule); stroke-width: 1.5; }
+  .d-box-a { fill: var(--accent-dim); stroke: var(--accent); stroke-width: 1.5; }
+  .d-ink { fill: var(--ink); }
+  .d-soft { fill: var(--muted); }
+  .d-acc { fill: var(--accent); }
+  .d-crit { fill: var(--crit); }
+  .d-ok { fill: var(--ok); }
+  .d-line { stroke: var(--muted); stroke-width: 1.3; fill: none; }
+  .d-line-crit { stroke: var(--crit); stroke-width: 1.3; fill: none; }
+  .d-line-dash { stroke: var(--muted); stroke-width: 1.2; fill: none; stroke-dasharray: 3 3; }
+
+  /* ---------- details ---------- */
+  details {
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: .8rem 1.1rem;
+    margin: 1.4rem 0;
+    background: var(--card);
+  }
+  summary {
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: .74rem;
+    letter-spacing: .06em;
+    color: var(--accent);
+    text-transform: uppercase;
+  }
+  details[open] summary { margin-bottom: .9rem; }
+  details > :last-child { margin-bottom: 0; }
+
+  footer {
+    border-top: 2px solid var(--ink);
+    margin-top: 4rem;
+    padding-top: 1.4rem;
+    font-family: var(--mono);
+    font-size: .72rem;
+    color: var(--muted);
+    line-height: 1.85;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+
+<div class="wrap">
+
+<header class="masthead">
+  <p class="eyebrow">
+    <span>Engineering Report</span>
+    <span>Linux&nbsp;/&nbsp;eBPF</span>
+    <span>2026-08-16</span>
+  </p>
+  <h1>Sealing the Chain</h1>
+  <p class="subtitle">Turning a process-execution monitor with a decorative hash chain into
+  one whose logs a root-level attacker cannot silently rewrite.</p>
+  <dl class="byline">
+    <dt>Project</dt><dd>rust_ebpf_agent — eBPF EDR agent, Rust + aya</dd>
+    <dt>Baseline</dt><dd>commit 20b75fe, "bug fixes"</dd>
+    <dt>Scope</dt><dd>Adversarial review, remediation, and a new off-box collector</dd>
+    <dt>Status</dt><dd>Static edits — not yet compiled or run (see §9)</dd>
+  </dl>
+</header>
+
+<section>
+  <h2 style="border-top:none;padding-top:0;margin-top:0"><span class="num">Abstract</span>What this report covers</h2>
+
+  <p class="lede">The project is a lightweight endpoint agent that watches every process
+  execution on a Linux host from inside the kernel and writes a tamper-evident log.
+  The baseline implementation had the right architecture and a hash chain that did
+  not work: it was unkeyed, so the attacker it was meant to catch could recompute it,
+  and it covered only half the fields in each record — including neither the severity
+  nor the parent process.</p>
+
+  <p>This report describes the system, audits that baseline, and documents the
+  remediation: forward-secure sealing under an evolving key, a length-prefixed
+  payload covering every field, sequence numbering, and a new off-box collector that
+  supplies the one thing an on-host log structurally cannot — an outside witness to
+  how many records should exist. Sixty-one findings are tracked; thirty are closed in
+  code. Three of them are defects in the code written during this work, found by
+  reviewing it against its own threat model, and are reported alongside the rest.</p>
+
+  <div class="stats">
+    <div class="stat"><div class="v">61</div><div class="k">Findings tracked</div></div>
+    <div class="stat"><div class="v">30</div><div class="k">Fixed in code</div></div>
+    <div class="stat"><div class="v">306</div><div class="k">Lines at baseline</div></div>
+    <div class="stat"><div class="v">3,039</div><div class="k">Lines now</div></div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">Section 1</span>What the system is</h2>
+
+  <p>An <b>EDR agent</b> — endpoint detection and response — is a background process that
+  records security-relevant activity on a machine so that an intrusion can be detected
+  while it happens and reconstructed afterwards. This one has a deliberately narrow
+  remit: it records process executions, and it tries very hard to make that record
+  hard to falsify.</p>
+
+  <h3><span class="num">1.1</span>How it sees executions</h3>
+
+  <p>The agent attaches a small program to the kernel's
+  <code>sched:sched_process_exec</code> tracepoint using <b>eBPF</b>, a mechanism that
+  lets user-supplied code run inside the kernel under a static verifier that proves it
+  cannot crash or loop forever. Every time any process on the host calls
+  <code>execve</code>, that program runs, captures a fixed-size record, and pushes it
+  through a per-CPU ring buffer to the userspace agent.</p>
+
+  <p>This is why the agent can be cheap. It is not polling <code>/proc</code>, not
+  scanning the filesystem, and not sitting in the path of any syscall it does not care
+  about. It is idle until an exec happens, and an exec costs it a few hundred
+  nanoseconds in the kernel plus a memory copy.</p>
+
+  <p>The workspace is four Rust crates: <code>edr-agent-ebpf</code> (the kernel probe,
+  <code>no_std</code>), <code>edr-agent</code> (the userspace daemon),
+  <code>edr-agent-common</code> (the shared kernel↔userspace ABI), and — new in this
+  work — <code>edr-collector</code>.</p>
+
+  <h3><span class="num">1.2</span>Why the log needs to be sealed</h3>
+
+  <p>The threat that shapes the whole design is an attacker who <em>gets root on the
+  monitored host</em>. That is not an edge case; it is the normal outcome of the
+  intrusions this agent exists to record. Once they have root, they can read the log
+  file, edit it, and delete the lines describing how they got in.</p>
+
+  <p>Nothing on the host can prevent that. The design goal is therefore weaker and
+  achievable: make the tampering <em>evident</em>. Each record is chained to the one
+  before it, so that altering any record invalidates every record after it, and doing
+  so undetectably requires something the attacker does not have.</p>
+
+  <p>That last clause is where the baseline failed.</p>
+</section>
+
+<section>
+  <h2><span class="num">Section 2</span>The baseline, as audited</h2>
+
+  <p>At commit <code>20b75fe</code> the project was about 306 lines of hand-written code
+  across four files. It worked: it loaded the probe, caught execs, scored them, and
+  appended JSON records to a write-ahead log. The architecture was sound. The
+  integrity mechanism was not.</p>
+
+  <h3><span class="num">2.1</span>The chain was unkeyed</h3>
+
+  <figure>
+    <pre><code><span class="cm">// edr-agent/src/main.rs @ 20b75fe</span>
+let data_to_hash = format!("{}{}{}{}{}",
+    timestamp, uid, pid, process_name, prev_hash);
+let computed_hash = <span class="bad">sha256</span>(data_to_hash);</code></pre>
+    <figcaption><b>Figure 1</b> — The entire integrity mechanism at baseline. A plain
+    SHA-256 over a string concatenation. Reproduced in <code>verify.py</code>, which
+    was 37 lines and hardcoded to read <code>/tmp/edr.wal</code>.</figcaption>
+  </figure>
+
+  <p>SHA-256 is a <em>public</em> function. There is no secret in that expression. An
+  attacker who edits a record can recompute its hash, then recompute every subsequent
+  hash in the file, and the result verifies perfectly. The chain detected accidental
+  corruption — a bad disk, a truncated write — and nothing else. Against the adversary
+  in the threat model it was decoration.</p>
+
+  <h3><span class="num">2.2</span>The chain covered half the record</h3>
+
+  <p>A second, independent flaw. The log record had eight content fields. The hash
+  covered four of them.</p>
+
+  <div class="tbl-scroll">
+  <table>
+    <thead><tr><th>Field in <code>AgentLog</code></th><th>Covered by the hash</th><th>Consequence if not</th></tr></thead>
+    <tbody>
+      <tr><td><code>timestamp</code></td><td><span class="sev f">Yes</span></td><td>—</td></tr>
+      <tr><td><code>uid</code></td><td><span class="sev f">Yes</span></td><td>—</td></tr>
+      <tr><td><code>pid</code></td><td><span class="sev f">Yes</span></td><td>—</td></tr>
+      <tr><td><code>process_name</code></td><td><span class="sev f">Yes</span></td><td>—</td></tr>
+      <tr><td><code>severity</code></td><td><span class="sev c">No</span></td><td>Rewrite <code>CRITICAL</code> → <code>INFO</code>; chain still verifies</td></tr>
+      <tr><td><code>event_type</code></td><td><span class="sev c">No</span></td><td>Reclassify the event entirely</td></tr>
+      <tr><td><code>ppid</code></td><td><span class="sev c">No</span></td><td>Erase the parent link — the attack chain</td></tr>
+      <tr><td><code>parent_process_name</code></td><td><span class="sev c">No</span></td><td>Rewrite lineage: make a shell look like it came from <code>systemd</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>This is worse than it first appears. Even had the hash been keyed, an attacker
+  could have downgraded every <code>CRITICAL</code> record to <code>INFO</code> and
+  severed every parent-child link in the log <em>without touching a single byte the
+  hash was computed over</em>. The fields that carry the meaning of an alert were
+  precisely the fields left outside the seal.</p>
+
+  <h3><span class="num">2.3</span>The concatenation was ambiguous</h3>
+
+  <p>The five values were joined with no delimiter at all. <code>process_name</code> is
+  chosen by the attacker — it is the name of a binary they can create. Two different
+  records could therefore be made to hash identically by shifting characters across the
+  implicit field boundary, letting one record be substituted for another.</p>
+
+  <h3><span class="num">2.4</span>Deletion was free</h3>
+
+  <p>Records had no sequence number. A hash chain proves that the records you are
+  holding are in order and unmodified. It says nothing about records that are no longer
+  there. Deleting the last <var>N</var> lines of the log leaves a chain that verifies
+  perfectly — and the last <var>N</var> lines are exactly the ones an attacker wants
+  gone.</p>
+
+  <h3><span class="num">2.5</span>Six further defects in the same file</h3>
+
+  <ul>
+    <li><b>The log lived in <code>/tmp</code>.</b> A world-writable directory. Any
+    unprivileged user could pre-create <code>/tmp/edr.wal</code> as a symlink and have
+    the root-run agent write through it to a file of their choosing.</li>
+
+    <li><b>Crash recovery recovered nothing.</b> The routine that ran on startup printed
+    <code>"Data verified. Cleaning up old pin"</code> and then deleted the pinned
+    kernel map. It read nothing. The comment on the line where the reading should have
+    happened said <code>// In the future: Load map here to read missed events</code>. The
+    pinned map is the mechanism that holds events buffered across an agent restart, and
+    startup destroyed it.</li>
+
+    <li><b>A panic on read.</b> <code>read_events(&mut buffers).await.unwrap()</code> —
+    a transient error in the perf ring terminated the agent.</li>
+
+    <li><b>An out-of-bounds read.</b> The perf record was cast to
+    <code>ProcessEvent</code> via <code>read_unaligned</code> with no check that the
+    buffer was large enough to hold one.</li>
+
+    <li><b>No rotation.</b> The log grew without bound until the partition filled — a
+    denial of service the attacker triggers by making noise.</li>
+
+    <li><b>Nothing left the host.</b> The comment read
+    <code>// B. Send to Network (Stdout for now)</code>. Every record, including the
+    sealed ones, stayed on the machine the attacker controlled.</li>
+  </ul>
+</section>
+
+<section>
+  <h2><span class="num">Section 3</span>Method</h2>
+
+  <p>The review was structured by <em>attacker objective</em> rather than by file:
+  for each thing an adversary would want — suppress a record, forge a record, blind the
+  sensor, kill the agent, poison the build — enumerate the ways the system as written
+  permits it. Findings were grouped by layer and given stable identifiers, which are
+  used throughout this report and in the source comments:</p>
+
+  <div class="tbl-scroll">
+  <table>
+    <thead><tr><th>Prefix</th><th>Layer</th><th>Count</th></tr></thead>
+    <tbody>
+      <tr><td><span class="fid">NOW</span></td><td>Live defects in the running agent</td><td class="num-cell">14</td></tr>
+      <tr><td><span class="fid">SEN</span></td><td>Sensor and eBPF probe fidelity</td><td class="num-cell">10</td></tr>
+      <tr><td><span class="fid">AGT</span></td><td>Agent process and privilege</td><td class="num-cell">8</td></tr>
+      <tr><td><span class="fid">STO</span></td><td>Storage and retention</td><td class="num-cell">7</td></tr>
+      <tr><td><span class="fid">PRX</span></td><td>Proxy in the delivery path</td><td class="num-cell">7</td></tr>
+      <tr><td><span class="fid">NET</span></td><td>Transport</td><td class="num-cell">6</td></tr>
+      <tr><td><span class="fid">SUP</span></td><td>Build and supply chain</td><td class="num-cell">5</td></tr>
+      <tr><td><span class="fid">COL</span></td><td>Defects in the new code, found reviewing it</td><td class="num-cell">3</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>The full text lives in <code>THREAT_MODEL.txt</code> (1,290 lines) beside the
+  source. Each entry states the issue, its severity, and a remediation — including for
+  findings that were not fixed, so the document is usable as a work list rather than
+  only as a record.</p>
+</section>
+
+<section>
+  <h2><span class="num">Section 4</span>Change one: forward-secure sealing</h2>
+
+  <p>The central fix. An unkeyed hash cannot resist an attacker with root, and neither
+  can a keyed hash whose key is sitting on the same disk — they simply read the key and
+  re-sign. The resolution is to make the key <em>change over time and destroy its own
+  past</em>, a construction due to Schneier and Kelsey and used by systemd's journal.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 620 268" role="img" aria-label="Diagram comparing the baseline unkeyed hash chain with forward-secure sealing under an evolving key.">
+        <!-- BEFORE -->
+        <text x="0" y="12" class="d-title d-crit">Baseline — unkeyed chain</text>
+        <g>
+          <rect x="0"   y="26" width="112" height="34" rx="3" class="d-box"/>
+          <rect x="136" y="26" width="112" height="34" rx="3" class="d-box"/>
+          <rect x="272" y="26" width="112" height="34" rx="3" class="d-box"/>
+          <text x="56"  y="47" text-anchor="middle" class="d-label d-ink">record n−1</text>
+          <text x="192" y="47" text-anchor="middle" class="d-label d-ink">record n</text>
+          <text x="328" y="47" text-anchor="middle" class="d-label d-ink">record n+1</text>
+          <path d="M112 43 H136" class="d-line" marker-end="url(#ar)"/>
+          <path d="M248 43 H272" class="d-line" marker-end="url(#ar)"/>
+          <text x="0" y="80" class="d-label d-soft">H(n) = SHA256( 4 of 8 fields ‖ H(n−1) )</text>
+          <text x="0" y="97" class="d-label d-crit">no secret → attacker recomputes the whole file</text>
+        </g>
+
+        <line x1="0" y1="118" x2="620" y2="118" class="d-line-dash"/>
+
+        <!-- AFTER -->
+        <text x="0" y="141" class="d-title d-ok">Now — sealed under an evolving key</text>
+
+        <!-- key schedule -->
+        <g>
+          <rect x="0"   y="156" width="72" height="26" rx="3" class="d-box-a"/>
+          <rect x="112" y="156" width="72" height="26" rx="3" class="d-box-a"/>
+          <rect x="224" y="156" width="72" height="26" rx="3" class="d-box-a"/>
+          <text x="36"  y="173" text-anchor="middle" class="d-label d-acc">K(e−1)</text>
+          <text x="148" y="173" text-anchor="middle" class="d-label d-acc">K(e)</text>
+          <text x="260" y="173" text-anchor="middle" class="d-label d-acc">K(e+1)</text>
+          <path d="M72 169 H112"  class="d-line" marker-end="url(#ar)"/>
+          <path d="M184 169 H224" class="d-line" marker-end="url(#ar)"/>
+          <text x="92"  y="151" text-anchor="middle" class="d-label d-soft">SHA256</text>
+          <text x="204" y="151" text-anchor="middle" class="d-label d-soft">SHA256</text>
+          <!-- erasure -->
+          <path d="M8 190 L64 190" class="d-line-crit"/>
+          <text x="76" y="194" class="d-label d-crit">zeroed after 60 s — unrecoverable</text>
+        </g>
+
+        <!-- records -->
+        <g>
+          <rect x="112" y="216" width="112" height="34" rx="3" class="d-box"/>
+          <rect x="248" y="216" width="112" height="34" rx="3" class="d-box"/>
+          <text x="168" y="237" text-anchor="middle" class="d-label d-ink">record n</text>
+          <text x="304" y="237" text-anchor="middle" class="d-label d-ink">record n+1</text>
+          <path d="M224 233 H248" class="d-line" marker-end="url(#ar)"/>
+          <path d="M148 182 V216" class="d-line" marker-end="url(#ar)"/>
+          <text x="376" y="228" class="d-label d-soft">MAC(n) = HMAC( K(e), 15 fields ‖ MAC(n−1) )</text>
+          <text x="376" y="244" class="d-label d-soft">every field length-prefixed; seq monotonic</text>
+        </g>
+
+        <defs>
+          <marker id="ar" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" fill="currentColor" class="d-soft"/>
+          </marker>
+        </defs>
+      </svg>
+    </div>
+    <figcaption><b>Figure 2</b> — The key schedule advances every 60 seconds and the
+    previous generation is zeroed in place. An attacker who takes the host at epoch
+    <i>e</i> holds K(e) and can forge the future; K(e−1) no longer exists anywhere on
+    the machine, so the past is beyond them.</figcaption>
+  </figure>
+
+  <h3><span class="num">4.1</span>The construction</h3>
+
+  <p>A 32-byte root key <b>K₀</b> is generated on first start and printed once, for the
+  operator to copy off the machine. Thereafter:</p>
+
+  <ul>
+    <li>Each record is sealed with <code>HMAC-SHA256</code> under the current epoch key,
+    over the record's fields concatenated with the previous record's MAC.</li>
+    <li>Every 60 seconds the key advances: <code>K(n+1) = SHA256(K(n))</code>, and
+    <code>K(n)</code> is overwritten in memory and on disk.</li>
+  </ul>
+
+  <p>Because SHA-256 is one-way, K(e) yields nothing about K(e−1). The property this
+  buys is precise, and worth stating precisely: <b>an attacker who compromises the host
+  at time T can forge records after T, but cannot forge or alter records written before
+  T without the alteration being detectable</b> by anyone holding K₀ off-box. It does
+  not stop them from lying about the future. It stops them from editing the evidence of
+  how they arrived.</p>
+
+  <h3><span class="num">4.2</span>Closing the payload</h3>
+
+  <p>Two changes to what gets sealed, both narrow and both necessary:</p>
+
+  <figure>
+    <div class="compare">
+      <div>
+        <div class="lbl before">Baseline</div>
+        <pre><code>format!("{}{}{}{}{}",
+  timestamp, uid, pid,
+  process_name, prev_hash)
+
+<span class="cm">// 4 of 8 fields
+// no delimiter
+// public function</span></code></pre>
+      </div>
+      <div>
+        <div class="lbl after">Now</div>
+        <pre><code>push(len as u32 be);
+push(field bytes);
+<span class="cm">// … for all 15 fields</span>
+
+<span class="cm">// every field sealed
+// length-prefixed
+// keyed, evolving</span></code></pre>
+      </div>
+    </div>
+    <figcaption><b>Figure 3</b> — <code>sealed_payload()</code> in
+    <code>edr-agent-common/src/record.rs</code>. Each field is prefixed with its length
+    as a big-endian <code>u32</code>, which makes the boundaries explicit and the
+    encoding injective: no attacker-chosen <code>process_name</code> can shift a field
+    boundary. Fields covered went from 4 to 15 — <code>severity</code>,
+    <code>event_type</code>, <code>ppid</code> and <code>parent_process_name</code>
+    among them.</figcaption>
+  </figure>
+
+  <p>The record format now lives in one module shared by the agent, the collector and
+  the Python verifier, rather than being written out three times. Drift between those
+  copies would silently break every verification, which is the kind of bug that is
+  found years later by an investigator who needed it to work.</p>
+
+  <div class="note">
+    <div class="hd">Findings closed</div>
+    <p><span class="fid">NOW-4</span> unkeyed chain ·
+    <span class="fid">NOW-5</span> ambiguous delimiter ·
+    <span class="fid">NOW-11</span> non-UTF-8 names now hex-encoded ·
+    <span class="fid">STO-4</span> sequence numbers added</p>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">Section 5</span>Change two: the collector</h2>
+
+  <p>Sealing solves forgery. It does not solve <em>deletion</em>, and no on-host
+  mechanism can. A log that has had its tail removed is indistinguishable from a log
+  that was never longer — the surviving records are genuine, correctly sealed, and in
+  order. Detecting the removal requires knowing how many records there should have
+  been, and that knowledge has to live somewhere the attacker does not control.</p>
+
+  <p><code>edr-collector</code> is a new 992-line crate that provides it: an HTTP
+  service, deployed off the monitored host, that verifies and stores what agents send.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 620 190" role="img" aria-label="Architecture diagram: monitored host containing the kernel probe, agent and write-ahead log, shipping through an untrusted proxy to the collector, with K0 delivered out of band by the operator.">
+        <!-- host -->
+        <rect x="0" y="30" width="196" height="120" rx="4" class="d-box"/>
+        <text x="10" y="24" class="d-title d-crit">Monitored host — attacker may own root</text>
+
+        <rect x="14" y="46" width="168" height="26" rx="3" class="d-box-a"/>
+        <text x="98" y="63" text-anchor="middle" class="d-label d-acc">eBPF probe — sched_process_exec</text>
+
+        <rect x="14" y="82" width="168" height="26" rx="3" class="d-box"/>
+        <text x="98" y="99" text-anchor="middle" class="d-label d-ink">agent — seal, score, append</text>
+
+        <rect x="14" y="118" width="168" height="26" rx="3" class="d-box"/>
+        <text x="98" y="135" text-anchor="middle" class="d-label d-ink">WAL + shipper cursor</text>
+
+        <path d="M98 72 V82" class="d-line" marker-end="url(#ar2)"/>
+        <path d="M98 108 V118" class="d-line" marker-end="url(#ar2)"/>
+
+        <!-- proxy -->
+        <rect x="236" y="76" width="96" height="38" rx="3" class="d-box"/>
+        <text x="284" y="92" text-anchor="middle" class="d-label d-ink">proxy</text>
+        <text x="284" y="105" text-anchor="middle" class="d-label d-crit">untrusted</text>
+        <path d="M196 95 H236" class="d-line" marker-end="url(#ar2)"/>
+
+        <!-- collector -->
+        <rect x="372" y="30" width="248" height="120" rx="4" class="d-box"/>
+        <text x="382" y="24" class="d-title d-ok">Collector — outside the blast radius</text>
+        <path d="M332 95 H372" class="d-line" marker-end="url(#ar2)"/>
+
+        <rect x="386" y="46" width="220" height="26" rx="3" class="d-box-a"/>
+        <text x="496" y="63" text-anchor="middle" class="d-label d-acc">verify MAC against enrolled K₀</text>
+
+        <rect x="386" y="82" width="220" height="26" rx="3" class="d-box"/>
+        <text x="496" y="99" text-anchor="middle" class="d-label d-ink">high-water seq — gaps are visible</text>
+
+        <rect x="386" y="118" width="220" height="26" rx="3" class="d-box"/>
+        <text x="496" y="135" text-anchor="middle" class="d-label d-ink">receipt time · silence · build id</text>
+
+        <!-- out of band key -->
+        <path d="M98 160 Q 300 186 496 160" class="d-line-dash"/>
+        <text x="297" y="184" text-anchor="middle" class="d-label d-soft">K₀ carried out of band by the operator — never crosses the proxy</text>
+
+        <defs>
+          <marker id="ar2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" fill="currentColor" class="d-soft"/>
+          </marker>
+        </defs>
+      </svg>
+    </div>
+    <figcaption><b>Figure 4</b> — Deployment. The proxy terminates TLS and is assumed
+    hostile: it never holds key material, so it can neither forge a batch nor usefully
+    replay one. Dropping batches is the attack it retains, which is what silence
+    detection exists to catch.</figcaption>
+  </figure>
+
+  <h3><span class="num">5.1</span>What it establishes</h3>
+
+  <div class="tbl-scroll">
+  <table>
+    <thead><tr><th>Property</th><th>Mechanism</th><th>Closes</th></tr></thead>
+    <tbody>
+      <tr><td>Records cannot be deleted silently</td><td>Per-host monotonic sequence high-water mark; a gap is recorded, flagged and answered with HTTP 409</td><td><span class="fid">NOW-3</span> <span class="fid">STO-4</span></td></tr>
+      <tr><td>Timestamps do not come only from the attacker's clock</td><td>Every record stored with a collector-stamped <code>received_at</code> beside the agent's own time</td><td><span class="fid">NOW-7</span></td></tr>
+      <tr><td>A wiped agent cannot mint itself a clean history</td><td>K₀ escrowed at enrollment; a re-keyed chain fails verification, and re-enrollment is refused without <code>--force</code></td><td><span class="fid">NOW-8</span></td></tr>
+      <tr><td>The proxy holds no key material</td><td>Enrollment is manual and out of band — K₀ never transits the network</td><td><span class="fid">PRX-1</span> <span class="fid">PRX-2</span></td></tr>
+      <tr><td>A stopped agent is not a quiet host</td><td><code>--silence-secs</code> alerts once per outage when a host goes dark</td><td><span class="fid">PRX-5</span></td></tr>
+      <tr><td>A replaced binary cannot report "all healthy"</td><td>Agent sends its own <code>dev:inode:mtime</code> each batch; mismatch against enrollment is recorded</td><td><span class="fid">SUP-2</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Silence deserves emphasis. It is the loudest signal the system has, and it is
+  inaudible from the host — an agent that has been killed cannot report that it was
+  killed. Only an observer expecting traffic can notice its absence.</p>
+
+  <h3><span class="num">5.2</span>The agent side</h3>
+
+  <p><code>edr-agent/src/shipper.rs</code> (366 lines) reads the write-ahead log rather
+  than tapping the event channel. That is deliberate: shipping from the WAL means a
+  record is durable before it is transmitted, and a crash mid-send loses nothing.
+  Position is tracked as <code>(inode, byte offset, acked_seq)</code>; the inode
+  comparison is what detects log rotation.</p>
+
+  <p>Catch-up is rate-limited to roughly 100 records per second by default. After a long
+  outage the backlog can be large, and an unthrottled drain would saturate the uplink
+  and spike CPU at precisely the moment somebody is already looking at the host.</p>
+
+  <div class="note caution">
+    <div class="hd">Two exposures the collector creates</div>
+    <p>Reported rather than glossed. <b>First</b>, the collector holds every enrolled
+    host's K₀ — compromising it grants the ability to forge any host's entire history
+    retroactively, which is strictly more power than compromising any single agent. It
+    must be watched more closely than the hosts it collects from. <b>Second</b>, the
+    workspace builds release with <code>panic = "abort"</code>, and the collector parses
+    attacker-influenced JSON on a network-facing path; one panic in a request handler
+    blinds every enrolled host at once.</p>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">Section 6</span>Change three: sensor and runtime</h2>
+
+  <h3><span class="num">6.1</span>What the probe now captures</h3>
+
+  <p>The kernel record grew from 5 fields to 9, each addressing a specific evasion:</p>
+
+  <div class="tbl-scroll">
+  <table>
+    <thead><tr><th>Added</th><th>Evasion it answers</th><th>Finding</th></tr></thead>
+    <tbody>
+      <tr><td><code>filename[128]</code></td><td><code>comm</code> is truncated to 15 characters by the kernel. A binary named <code>systemd-journald-x</code> presents as <code>systemd-journal</code>. The full path from the tracepoint's <code>__data_loc</code> field defeats the masquerade.</td><td><span class="fid">SEN-4</span></td></tr>
+      <tr><td><code>cgroup_id</code></td><td>Double-forking reparents a process to PID 1, destroying the <code>ppid</code> link. The cgroup id survives it.</td><td><span class="fid">SEN-1</span></td></tr>
+      <tr><td><code>ktime_ns</code></td><td>Ordering under load, taken in-kernel at the moment of exec rather than when userspace gets round to reading it. Wall-clock time is derived from a boot offset measured once.</td><td><span class="fid">NOW-12</span></td></tr>
+      <tr><td><code>_pad</code></td><td>Explicit padding, so the ABI layout is stated rather than inferred. The struct is read back with <code>read_unaligned</code>, and compiler-inserted padding would be uninitialised kernel bytes crossing the boundary.</td><td>—</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3><span class="num">6.2</span>Runtime robustness</h3>
+
+  <ul>
+    <li><b>The log moved to <code>/var/log/edr</code>, mode 0700</b>, opened with
+    <code>O_NOFOLLOW</code> and checked for symlinks, directory type, permissions and
+    hardlinks before any write. <span class="fid">NOW-1</span></li>
+
+    <li><b>Perf ring headroom raised from 2 pages to 16</b> — 8 KB to 64 KB per CPU,
+    roughly 40 to 340 events of burst capacity, at a cost of about 1 MB of RSS on a
+    16-core host. The <code>lost</code> counter is now surfaced and alerted, but the
+    counter only tells you drops happened; the headroom is what stops a noisy exec
+    burst from causing them. Inducing drops is cheap for an attacker and dropping
+    events is what they want. <span class="fid">NOW-2</span></li>
+
+    <li><b>Bounds check before the cast</b>, replacing the out-of-bounds read.
+    <span class="fid">NOW-3</span></li>
+
+    <li><b>SIGTERM handled alongside SIGINT</b>, so a normal <code>systemctl stop</code>
+    flushes rather than truncating. <span class="fid">NOW-9</span></li>
+
+    <li><b><code>flock</code> on the log</b> — a second instance refuses to start
+    instead of interleaving two chains into one file. <span class="fid">NOW-10</span></li>
+
+    <li><b>256 MB cap with one-generation rotation</b>, replacing unbounded growth.
+    <span class="fid">NOW-14</span></li>
+
+    <li><b>Non-blocking send with a counted drop</b>, replacing a blocking send that
+    applied backpressure into the kernel read loop. <span class="fid">AGT-4</span></li>
+
+    <li><b>Read-side plausibility validation</b> — events with impossible PIDs, zero or
+    future kernel timestamps, empty <code>comm</code>, or non-zero reserved padding are
+    rejected and counted. This makes sloppy injection into the pinned map noisy. It
+    does <em>not</em> defeat careful injection, and <span class="fid">SEN-6</span>
+    remains open.</li>
+  </ul>
+
+  <h3><span class="num">6.3</span>Detection scoring</h3>
+
+  <p>One change of posture rather than of code. Reconnaissance and anti-forensics
+  tooling — <code>bpftool</code>, <code>chattr</code>, <code>shred</code>,
+  <code>auditctl</code> — now scores <span class="sev c">CRITICAL</span>. An attacker
+  enumerating the monitoring before disabling it is not noise to be filtered; it is one
+  of the highest-signal events the agent will ever see. <span class="fid">DISC-1</span></p>
+</section>
+
+<section>
+  <h2><span class="num">Section 7</span>Reviewing the new code against its own model</h2>
+
+  <p>The collector was then audited the same way the original agent had been. Three
+  defects were found in code written during this work. They are reported here for the
+  same reason they are in the threat model: a review that exempts its own output is not
+  a review.</p>
+
+  <h3><span class="num">7.1</span><span class="sev h">High</span> &nbsp;<span class="fid">COL-1</span> — unbounded key derivation from unverified input</h3>
+
+  <p>The <code>epoch</code> field selects which key verifies a record. It therefore
+  cannot itself be verified first — that is a property of the construction, not an
+  oversight. It was then used directly as a loop count, one SHA-256 per iteration.</p>
+
+  <p>A single HTTP POST carrying <code>epoch = 2⁶⁴−1</code> spins inside the request
+  handler while holding the mutex every other host needs. No forgery, no credentials, no
+  access to any agent: one request blinds the entire fleet, and unlike a panic it never
+  recovers.</p>
+
+  <p><b>Fixed</b> by capping derivation at <code>MAX_EPOCH_WALK</code> — about two years
+  of continuous agent uptime — and refusing anything beyond as an anomaly rather than
+  computing it. The same constant was added to <code>verify.py</code>, because the
+  offline verifier is what an investigator runs against exactly the file an attacker
+  just wrote; hanging the verifier stops an investigation as effectively as deleting
+  the records.</p>
+
+  <h3><span class="num">7.2</span><span class="sev h">Medium</span> &nbsp;<span class="fid">COL-2</span> — a storage failure destroyed the batch it failed on</h3>
+
+  <p>In-memory state advanced per record as a batch was processed. If the append to disk
+  then failed, the handler returned without rolling back, so the agent's retry hit the
+  "already seen this sequence" branch and the batch was discarded permanently. One
+  transient <code>ENOSPC</code> silently destroyed telemetry both sides believed was
+  safe. The acknowledgement returned on that path was also computed as
+  <code>high_seq − accepted</code>, which is wrong whenever sequence numbers are not
+  dense — it could acknowledge records that were never written.</p>
+
+  <p><b>Fixed</b> by snapshotting state before the batch, restoring it on write failure,
+  and acknowledging the snapshot's high-water mark.</p>
+
+  <h3><span class="num">7.3</span><span class="sev h">Low</span> &nbsp;<span class="fid">COL-3</span> — the verifier aborted instead of reporting</h3>
+
+  <p>A non-numeric <code>seq</code> or <code>epoch</code> in a tampered log reached a
+  comparison in <code>verify.py</code> and raised <code>TypeError</code>, ending the run
+  with a traceback at the first bad record rather than an alert. An attacker who cannot
+  forge a record could still make the verifier fall over. <b>Fixed</b> by type- and
+  range-checking both fields and reporting the failure like any other integrity
+  violation.</p>
+
+  <div class="note">
+    <div class="hd">The generalisation</div>
+    <p>A value taken from unverified input and used as a loop count, an allocation size,
+    or an index is a denial of service until it is bounded. Rust's type system caught
+    the parsing half for free — <code>serde_json</code> into a <code>u64</code> rejects
+    a string or a negative — but not the range half, and the Python verifier of the same
+    format had neither.</p>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">Section 8</span>Where it stands</h2>
+
+  <div class="tbl-scroll">
+  <table>
+    <thead><tr><th>Disposition</th><th>Count</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><b>Fixed in code</b></td><td class="num-cell">30</td><td>27 from the audit plus the 3 self-review defects</td></tr>
+      <tr><td><b>Partially fixed</b></td><td class="num-cell">6</td><td>Mitigated but not closed; <span class="fid">SEN-6</span> is the significant one</td></tr>
+      <tr><td><b>Needs components that do not exist</b></td><td class="num-cell">20</td><td>Transport hardening, dashboard, storage backend, retention</td></tr>
+      <tr><td><b>Out of scope or accepted</b></td><td class="num-cell">5</td><td>Host-platform controls, or features rather than fixes</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3><span class="num">8.1</span>What the system now resists</h3>
+
+  <ul>
+    <li>Editing any field of any record written before the compromise, undetectably.</li>
+    <li>Deleting records, including the tail, without a visible sequence gap off-box.</li>
+    <li>Wiping the log and state to mint a clean history under a fresh key.</li>
+    <li>Renaming a binary to hide behind <code>comm</code>'s 15-character truncation.</li>
+    <li>Double-forking to sever the parent link.</li>
+    <li>A hostile TLS-terminating proxy reading, forging or replaying batches.</li>
+    <li>Killing the agent and having the host read as merely quiet.</li>
+    <li>Replacing the binary with a stub that heartbeats convincingly.</li>
+  </ul>
+
+  <h3><span class="num">8.2</span>What it does not</h3>
+
+  <ul>
+    <li><b>Anything that never calls <code>execve</code>.</b> Only
+    <code>sched_process_exec</code> is hooked. Code injected into a running process, an
+    interpreter loading a payload from a socket, a library forced in via
+    <code>LD_PRELOAD</code> — all invisible. This is the largest coverage gap in the
+    system. <span class="fid">SEN-2</span></li>
+
+    <li><b>Careful injection into the pinned map.</b> Plausibility checks catch sloppy
+    forgery. An attacker who reads the probe source can craft values that pass.
+    <span class="fid">SEN-6</span></li>
+
+    <li><b>Forging records after the compromise.</b> Inherent to forward-secure sealing
+    and not a defect: the attacker holds the current key. Only the past is protected.</li>
+
+    <li><b>Running on a kernel other than the one it was built against.</b> No CO-RE
+    relocations; <code>vmlinux.rs</code> offsets are fixed at build time, and wrong
+    offsets produce confident nonsense rather than an error. <span class="fid">SEN-7</span></li>
+
+    <li><b>A kernel rootkit.</b> Below the agent's vantage point entirely; this is
+    Secure Boot, lockdown and module signing territory. <span class="fid">SEN-8</span></li>
+
+    <li><b>Privilege separation.</b> The agent still runs as root. systemd hardening
+    bounds the blast radius; it does not remove the condition.
+    <span class="fid">AGT-2</span></li>
+  </ul>
+</section>
+
+<section>
+  <h2><span class="num">Section 9</span>Verification status</h2>
+
+  <div class="note caution">
+    <div class="hd">Read this before relying on any of the above</div>
+    <p><b>None of this code has been compiled or executed.</b> The agent is Linux-only
+    and does not build on the machine the review was performed on. Every change
+    described here is a static edit, reasoned from source, and must be compiled and
+    tested on Linux before any of it is believed.</p>
+  </div>
+
+  <p>Specifically outstanding:</p>
+
+  <ul>
+    <li><b>The eBPF changes can fail the kernel verifier at load time.</b> The probe now
+    reads a variable-length <code>__data_loc</code> field, which is exactly the kind of
+    bounds-dependent access the verifier rejects. No amount of reading reveals this;
+    only loading it does.</li>
+    <li><b>Fifteen unit tests are written and unrun</b> — five in
+    <code>record.rs</code> (round-trip, per-field tampering, the field-boundary
+    regression, key evolution, wrong root key), nine in the collector (including
+    truncation-as-gap, path traversal in host ids, and the <span class="fid">COL-1</span>
+    regression), one in the shipper. <code>verify.py --selftest</code> covers the Python
+    side.</li>
+    <li><b>The performance figures are derived by inspection, not measured.</b> Perf
+    ring headroom and RSS are computed from struct sizes and page counts.</li>
+    <li><b>The collector has no TLS of its own</b> and expects a terminating proxy. There
+    is no dashboard; <code>status</code> and <code>verify</code> are CLI only, and alerts
+    go to stderr, which means the journal. Nothing pages anyone.</li>
+  </ul>
+
+  <h3><span class="num">9.1</span>Suggested order of work</h3>
+
+  <ol>
+    <li>Compile the workspace on the target kernel; load the probe and confirm the
+    verifier accepts it.</li>
+    <li>Run the test suites, including <code>verify.py --selftest</code>.</li>
+    <li>Generate a log, tamper with it deliberately, and confirm
+    <code>verify.py</code> reports each class of tampering.</li>
+    <li>Enroll a host against a collector, ship, then delete the tail of the log and
+    confirm the gap is reported.</li>
+    <li>Measure the resource figures in §6.2 under a realistic exec load rather than
+    trusting the estimates.</li>
+    <li>Then decide on <span class="fid">SEN-2</span> — additional probes are the
+    largest available increase in coverage, and the sealing work applies to them
+    unchanged.</li>
+  </ol>
+</section>
+
+<footer>
+  <p>Sources: <code>THREAT_MODEL.txt</code> · <code>packaging/INSTALL.md</code> ·
+  baseline at commit <code>20b75fe</code><br>
+  Findings referenced by identifier throughout; full text and remediation notes in the
+  threat model.</p>
+</footer>
+
+</div>

@@ -1,0 +1,80 @@
+# systemd unit for the eBPF EDR agent.
+#
+# Install: /etc/systemd/system/edr-agent.service, root:root, mode 0644.
+# The unit file must not be writable by anyone but root -- a writable unit file
+# for a root service is a privilege escalation, not an untidiness (AGT-6).
+
+[Unit]
+Description=eBPF EDR Agent
+Documentation=file:///opt/edr-agent/THREAT_MODEL.txt
+After=network.target
+# The agent should be running before anything it is meant to watch.
+DefaultDependencies=no
+Before=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/edr-agent
+
+# AGT-1: a single SIGKILL stops all collection and nothing restarts it.
+# Restart=always removes the cheapest possible way to blind the host.
+# The agent cannot defend against this itself; supervision is the answer.
+Restart=always
+RestartSec=1s
+# Never give up. The default StartLimitBurst would stop restarting after a few
+# rapid failures, which is exactly the state an attacker wants to induce.
+StartLimitIntervalSec=0
+
+# NOW-9: the agent drains its buffer on SIGTERM. Give it time to finish before
+# systemd escalates to SIGKILL and discards whatever is still in flight.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+# NOW-6: an explicit, minimal environment. `sudo -E` used to carry the caller's
+# environment across the privilege boundary; do not reintroduce that here by
+# adding PassEnvironment.
+Environment=RUST_LOG=info
+
+# stdout carries one JSON line per event and is the placeholder for the shipping
+# transport. Left on the journal it writes every event to disk a second time,
+# outside the WAL's 256M cap (NOW-14) -- the agent becomes its own disk-fill.
+# Discard it until a real collector exists; the WAL is the record of truth.
+# Replace with a pipe to the shipper when the transport lands.
+StandardOutput=null
+StandardError=journal
+
+# AGT-2: the agent runs as root today, so a memory-safety bug in it is a host
+# compromise. Until privilege dropping lands after BPF load, these directives
+# are what bound the blast radius. Each one is a capability the agent does not
+# need and therefore cannot be made to use.
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_DAC_OVERRIDE
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+# NOW-1: the WAL lives here and nowhere world-writable. The agent creates this
+# 0700 and refuses to start if it is group- or world-writable.
+ReadWritePaths=/var/log/edr
+# The pinned map lives under bpffs and has to be writable to be pinned at all.
+ReadWritePaths=/sys/fs/bpf
+
+# NOW-14: a second ceiling above the agent's own WAL cap (256M), in case the cap
+# is ever raised or the rotation path fails. The security agent must not be the
+# reason the host runs out of disk. Per-file, so 512M leaves rotation headroom.
+LimitFSIZE=536870912
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

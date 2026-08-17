@@ -1,0 +1,78 @@
+[Unit]
+Description=EDR Collector - off-box verifier and store for sealed agent logs
+Documentation=file:/usr/share/doc/edr/THREAT_MODEL.txt
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/edr-collector --data-dir /var/lib/edr-collector serve \
+    --listen 127.0.0.1:8080 \
+    --silence-secs 300 \
+    --dashboard-listen 127.0.0.1:8081
+
+# Bound to localhost above on purpose. Terminate TLS in front of this
+# (nginx, caddy) and let that handle certificates and client limits. The
+# collector speaks plain HTTP and has no business being reachable directly.
+#
+# It does NOT need to trust that proxy. The proxy never sees K0, cannot forge a
+# record and cannot usefully replay one, because seq must advance (PRX-1,
+# PRX-2). What it can do is drop batches, which is what --silence-secs exists
+# to catch.
+#
+# TWO PORTS, AND THEY ARE NOT INTERCHANGEABLE.
+#   8080 - ingest. Write-only, every record authenticated by MAC. This is the
+#          one the proxy reaches, and the proxy is hostile in the threat model.
+#   8081 - dashboard. Read-only, NO authentication of its own, and it will hand
+#          over every alert on every host to anyone who can open it.
+# Never expose 8081 through the same reverse proxy vhost as 8080, and never
+# publish it to the agent-facing network. Put it behind an authenticating proxy
+# (SSO, mTLS, or a VPN-only listener) or reach it over an SSH tunnel:
+#   ssh -N -L 8081:127.0.0.1:8081 collector-host
+# Pass --dashboard-listen off to disable it entirely on headless deployments.
+
+Restart=always
+RestartSec=2s
+StartLimitIntervalSec=0
+Environment=RUST_LOG=info
+
+# This process holds every enrolled host's K0. It is the anchor the whole
+# scheme rests on: an attacker who reads these files can forge any host's
+# entire history retroactively. Treat this unit as more sensitive than the
+# agents it collects from.
+User=edr-collector
+Group=edr-collector
+DynamicUser=no
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+ReadWritePaths=/var/lib/edr-collector
+UMask=0077
+
+# The store grows with every event from every host. Size these to the fleet.
+MemoryMax=1G
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
