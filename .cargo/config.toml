@@ -1,2 +1,9 @@
+# NOW-6: this was `sudo -E`, which preserves the caller's environment across the
+# privilege boundary. LD_PRELOAD, RUSTFLAGS or RUST_LOG set by anyone who can
+# influence a developer's shell then cross into a root process -- code execution
+# in the first two cases, and a disk-filling log flood in the third.
+#
+# Plain `sudo` resets the environment. If the agent ever needs a variable at
+# runtime, pass it explicitly rather than reinstating -E.
 [target."cfg(all())"]
-runner = "sudo -E"
+runner = "sudo"

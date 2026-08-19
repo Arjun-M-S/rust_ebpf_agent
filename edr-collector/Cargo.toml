@@ -1,0 +1,21 @@
+[package]
+name = "edr-collector"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+edr-agent-common = { path = "../edr-agent-common", features = ["user"] }
+
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "fs", "signal", "time", "sync"] }
+clap = { workspace = true, features = ["derive", "help", "usage", "error-context"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = "0.8"
+chrono = "0.4"
+env_logger = { workspace = true }
+
+[[bin]]
+name = "edr-collector"
+path = "src/main.rs"

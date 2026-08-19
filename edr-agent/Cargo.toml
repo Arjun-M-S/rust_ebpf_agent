@@ -22,13 +22,20 @@ tokio = { workspace = true, features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
+
+# Forward-secure sealing: HMAC for the record tag, SHA256 for key evolution,
+# getrandom for K0. An unkeyed digest is recomputable by the root attacker the
+# threat model assumes, so the key is what does the work here.
 sha2 = "0.10"
+getrandom = "0.2"
 hex = "0.4"
 
-[build-dependencies]
-anyhow = { workspace = true }
-aya-build = { workspace = true }
-cargo_metadata = { workspace = true }
+# Shipper. rustls rather than the system OpenSSL: one fewer C dependency in a
+# binary that runs as root, and no reliance on however the host was built.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# build.rs shells out to `cargo build` directly and uses only std,
+# so it declares no build-dependencies.
 
 [[bin]]
 name = "edr-agent"
