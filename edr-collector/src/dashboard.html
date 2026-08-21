@@ -8,18 +8,22 @@
   /* Single dark theme, deliberately. This is a console that gets left open on a
      wall display in a dim room, not a document. */
   :root {
-    --bg: #0e1116;
-    --panel: #161b22;
-    --panel-2: #1c232c;
-    --line: #2a323d;
-    --text: #d7dee7;
+    --bg: #0b0e13;
+    --panel: #141a23;
+    --panel-2: #1b232e;
+    --line: #262f3c;
+    --text: #dbe3ee;
     --dim: #8b98a8;
     --faint: #5d6975;
-    --crit: #ff5c5c;
+    --crit: #ff5c6c;
     --high: #ff9d43;
     --med: #ffd056;
-    --ok: #4ec98a;
+    --ok: #3ddc97;
     --accent: #5aa9ff;
+    --violet: #a78bfa;
+    --card: linear-gradient(180deg, #161d27 0%, #111721 100%);
+    --hdr: 53px;   /* header height: 13 + 26 + 13 + 1px border */
+    --shadow: 0 1px 0 rgba(255,255,255,.03) inset, 0 8px 24px -12px rgba(0,0,0,.9);
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
@@ -28,137 +32,207 @@
     color: var(--text);
     font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
   }
+  /* Depth, so the page doesn't read as a stack of grey rectangles. */
+  body::before {
+    content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+    background:
+      radial-gradient(900px 500px at 12% -8%, rgba(90,169,255,.13), transparent 65%),
+      radial-gradient(700px 460px at 92% 0%, rgba(167,139,250,.10), transparent 60%),
+      radial-gradient(800px 600px at 50% 110%, rgba(61,220,151,.06), transparent 60%);
+  }
+  .sans { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
 
   header {
-    display: flex; align-items: center; gap: 16px;
-    padding: 12px 20px;
-    background: var(--panel);
+    display: flex; align-items: center; gap: 14px;
+    padding: 13px 22px;
+    background: rgba(15,20,28,.82);
+    backdrop-filter: blur(12px);
     border-bottom: 1px solid var(--line);
     position: sticky; top: 0; z-index: 10;
   }
+  .mark {
+    width: 26px; height: 26px; border-radius: 8px; flex: none;
+    background: linear-gradient(140deg, var(--accent), var(--violet));
+    box-shadow: 0 0 18px -4px rgba(90,169,255,.7);
+    display: grid; place-items: center;
+    font: 700 13px/1 system-ui, sans-serif; color: #0b0e13;
+  }
   header h1 {
-    font-size: 14px; font-weight: 600; margin: 0;
-    letter-spacing: .08em; text-transform: uppercase;
+    font: 600 14px/1 system-ui, -apple-system, sans-serif; margin: 0;
+    letter-spacing: .14em; text-transform: uppercase;
+    background: linear-gradient(90deg, #eaf2ff, #9fc6ff 60%, var(--violet));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
   }
   .spacer { flex: 1; }
   .meta { color: var(--dim); font-size: 12px; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-  .dot.live { background: var(--ok); }
-  .dot.stale { background: var(--crit); }
+
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+  .dot.live { background: var(--ok); box-shadow: 0 0 0 0 rgba(61,220,151,.55); animation: ping 2.4s ease-out infinite; }
+  .dot.stale { background: var(--crit); box-shadow: 0 0 8px rgba(255,92,108,.8); }
+  @keyframes ping {
+    0%   { box-shadow: 0 0 0 0 rgba(61,220,151,.5); }
+    70%  { box-shadow: 0 0 0 7px rgba(61,220,151,0); }
+    100% { box-shadow: 0 0 0 0 rgba(61,220,151,0); }
+  }
 
   button, select, input {
     background: var(--panel-2); color: var(--text);
-    border: 1px solid var(--line); border-radius: 4px;
-    padding: 5px 9px; font: inherit; font-size: 12px;
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 6px 11px; font: inherit; font-size: 12px;
+    transition: border-color .15s, color .15s, background .15s, transform .1s;
   }
   button { cursor: pointer; }
-  button:hover { border-color: var(--accent); }
-  button.on { border-color: var(--accent); color: var(--accent); }
-  input { min-width: 200px; }
+  button:hover, select:hover { border-color: var(--accent); color: #fff; }
+  button:active { transform: translateY(1px); }
+  button.on {
+    border-color: rgba(90,169,255,.6); color: var(--accent);
+    background: rgba(90,169,255,.10);
+    box-shadow: 0 0 16px -6px rgba(90,169,255,.9);
+  }
+  input { min-width: 230px; }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
 
   #banner {
-    display: none;
-    margin: 0; padding: 11px 20px;
-    background: rgba(255,92,92,.12);
-    border-bottom: 1px solid var(--crit);
-    color: var(--crit);
-    font-weight: 600;
+    display: none; margin: 0; padding: 12px 22px;
+    background: linear-gradient(90deg, rgba(255,92,108,.20), rgba(255,92,108,.06));
+    border-bottom: 1px solid rgba(255,92,108,.55);
+    color: #ffb3bb; font-weight: 600;
+    animation: alarm 2.2s ease-in-out infinite;
   }
   #banner.show { display: block; }
+  @keyframes alarm { 0%,100% { box-shadow: inset 0 0 0 rgba(255,92,108,0); } 50% { box-shadow: inset 0 -40px 40px -40px rgba(255,92,108,.45); } }
 
-  .tiles {
-    display: grid; gap: 1px;
-    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-    background: var(--line);
-    border-bottom: 1px solid var(--line);
+  .pad { padding: 16px 22px 0; }
+  .grid { display: grid; gap: 12px; }
+  .tiles { grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); }
+  .charts { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); margin-top: 12px; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; padding: 14px 16px; box-shadow: var(--shadow);
+    position: relative;
+    /* clip, not hidden: `hidden` would make this card the sticky thead's
+       scroll container and float the header row into the middle of the log. */
+    overflow: clip;
   }
-  .tile { background: var(--panel); padding: 14px 18px; }
-  .tile .k {
-    font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+  .card::after {
+    content: ""; position: absolute; inset: 0 0 auto 0; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,.14), transparent);
+  }
+  .k {
+    font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
     color: var(--faint);
   }
-  .tile .v { font-size: 24px; font-weight: 600; margin-top: 4px; }
-  .tile .v.bad { color: var(--crit); }
+  .tile .v {
+    font: 700 27px/1.1 system-ui, sans-serif; margin-top: 6px;
+    font-variant-numeric: tabular-nums;
+  }
+  .tile .v.bad  { color: var(--crit); text-shadow: 0 0 22px rgba(255,92,108,.45); }
   .tile .v.good { color: var(--ok); }
+  .tile { transition: transform .15s, border-color .15s; }
+  .tile:hover { transform: translateY(-2px); border-color: #33405120; }
+  .spark { display: block; width: 100%; height: 26px; margin-top: 6px; }
 
-  .wrap { display: grid; grid-template-columns: 250px 1fr; min-height: 0; }
-  @media (max-width: 860px) { .wrap { grid-template-columns: 1fr; } }
+  /* ---- donuts ---- */
+  .chart { display: flex; align-items: center; gap: 14px; margin-top: 10px; }
+  .donut { width: 104px; height: 104px; flex: none; overflow: visible; }
+  .donut circle { transition: stroke-width .15s, opacity .15s; }
+  .donut circle.seg:hover { stroke-width: 5.4; }
+  .donut .ctr-v { font: 700 8px/1 system-ui, sans-serif; fill: var(--text); }
+  .donut .ctr-k { font: 500 2.9px/1 system-ui, sans-serif; fill: var(--faint); letter-spacing: .18em; }
+  .legend { flex: 1; min-width: 0; display: grid; gap: 5px; align-content: center; }
+  .lg { display: flex; align-items: center; gap: 7px; font-size: 11.5px; cursor: default; }
+  .lg .sw { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+  .lg .lb { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
+  .lg .nu { font-variant-numeric: tabular-nums; color: var(--text); }
+  .lg .pc { color: var(--faint); width: 34px; text-align: right; font-variant-numeric: tabular-nums; }
+  .lg:hover .lb { color: var(--text); }
 
-  aside {
-    border-right: 1px solid var(--line);
-    padding: 14px 0;
-    background: var(--panel);
-  }
-  .side-h {
-    font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
-    color: var(--faint); padding: 0 18px 8px;
-  }
+  /* ---- top-process bars ---- */
+  .bars { display: grid; gap: 8px; margin-top: 12px; }
+  .brow { display: grid; grid-template-columns: 1fr auto; gap: 3px 10px; font-size: 11.5px; }
+  .brow .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .brow .ct { color: var(--dim); font-variant-numeric: tabular-nums; }
+  .track { grid-column: 1 / -1; height: 5px; border-radius: 3px; background: var(--panel-2); overflow: hidden; }
+  .fill { height: 100%; border-radius: 3px; transition: width .5s cubic-bezier(.22,1,.36,1); }
+
+  .wrap { display: grid; grid-template-columns: 262px 1fr; gap: 12px; padding: 12px 22px 60px; align-items: start; }
+  @media (max-width: 900px) { .wrap { grid-template-columns: 1fr; } }
+
+  aside { padding: 14px 0 8px; }
+  .side-h { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--faint); padding: 0 16px 10px; }
   .host {
-    padding: 8px 18px; cursor: pointer;
-    border-left: 2px solid transparent;
+    padding: 8px 16px; cursor: pointer; border-left: 2px solid transparent;
+    transition: background .15s, border-color .15s;
   }
   .host:hover { background: var(--panel-2); }
-  .host.sel { border-left-color: var(--accent); background: var(--panel-2); }
-  .host .n { display: flex; align-items: center; gap: 7px; }
+  .host.sel {
+    border-left-color: var(--accent);
+    background: linear-gradient(90deg, rgba(90,169,255,.14), transparent);
+  }
+  .host .n { display: flex; align-items: center; gap: 8px; }
   .host .s { color: var(--faint); font-size: 11px; margin-top: 2px; }
 
-  main { padding: 14px 20px 60px; min-width: 0; }
+  main { min-width: 0; padding: 0; }
   .bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
 
+  .tablecard { padding: 4px 4px 6px; }
   table { width: 100%; border-collapse: collapse; }
   thead th {
-    text-align: left; font-size: 10px; letter-spacing: .09em;
+    text-align: left; font-size: 10px; letter-spacing: .1em;
     text-transform: uppercase; color: var(--faint);
-    padding: 7px 10px; border-bottom: 1px solid var(--line);
-    position: sticky; top: 49px; background: var(--bg);
+    padding: 9px 10px; border-bottom: 1px solid var(--line);
+    position: sticky; top: var(--hdr); background: #171e28; z-index: 5;
   }
   tbody td {
-    padding: 7px 10px; border-bottom: 1px solid var(--panel-2);
+    padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,.04);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     max-width: 260px;
   }
-  tbody tr { cursor: pointer; }
-  tbody tr:hover { background: var(--panel); }
-  tbody tr.unver { background: rgba(255,92,92,.07); }
+  tbody tr { cursor: pointer; transition: background .12s; }
+  tbody tr:hover { background: rgba(90,169,255,.07); }
+  tbody tr.unver { background: rgba(255,92,108,.08); box-shadow: inset 2px 0 0 var(--crit); }
+  tbody tr.unver:hover { background: rgba(255,92,108,.14); }
 
-  .sev { font-weight: 700; font-size: 11px; letter-spacing: .05em; }
-  .sev.CRITICAL { color: var(--crit); }
-  .sev.HIGH { color: var(--high); }
-  .sev.MEDIUM { color: var(--med); }
-  .sev.INFO { color: var(--dim); }
-
-  .badge {
-    font-size: 10px; padding: 1px 6px; border-radius: 3px;
-    border: 1px solid currentColor;
+  .sev {
+    font-weight: 700; font-size: 10px; letter-spacing: .06em;
+    padding: 2px 7px; border-radius: 999px; border: 1px solid currentColor;
   }
-  .badge.y { color: var(--ok); }
-  .badge.n { color: var(--crit); font-weight: 700; }
+  .sev.CRITICAL { color: var(--crit); background: rgba(255,92,108,.12); }
+  .sev.HIGH     { color: var(--high); background: rgba(255,157,67,.12); }
+  .sev.MEDIUM   { color: var(--med);  background: rgba(255,208,86,.12); }
+  .sev.INFO     { color: var(--dim);  background: rgba(139,152,168,.10); }
 
-  .empty { color: var(--faint); padding: 40px 10px; text-align: center; }
+  .badge { font-size: 10px; padding: 2px 7px; border-radius: 999px; border: 1px solid currentColor; }
+  .badge.y { color: var(--ok); background: rgba(61,220,151,.10); }
+  .badge.n { color: var(--crit); background: rgba(255,92,108,.12); font-weight: 700; }
+
+  .empty { color: var(--faint); padding: 44px 10px; text-align: center; }
 
   /* Detail drawer */
   #drawer {
     position: fixed; top: 0; right: 0; bottom: 0; width: min(560px, 92vw);
-    background: var(--panel); border-left: 1px solid var(--line);
+    background: linear-gradient(180deg, #161d27, #0f141c);
+    border-left: 1px solid var(--line);
+    box-shadow: -30px 0 60px -30px rgba(0,0,0,.9);
     padding: 18px 20px; overflow-y: auto;
-    transform: translateX(100%); transition: transform .16s ease-out;
+    transform: translateX(100%); transition: transform .22s cubic-bezier(.22,1,.36,1);
     z-index: 20;
   }
   #drawer.open { transform: none; }
-  #drawer h2 { font-size: 13px; margin: 0 0 14px; letter-spacing: .06em; text-transform: uppercase; }
-  .kv { display: grid; grid-template-columns: 130px 1fr; gap: 5px 12px; }
+  #drawer h2 { font: 600 13px/1.4 system-ui, sans-serif; margin: 0 0 14px; letter-spacing: .06em; text-transform: uppercase; }
+  .kv { display: grid; grid-template-columns: 130px 1fr; gap: 6px 12px; }
   .kv dt { color: var(--faint); font-size: 11px; }
-  .kv dd {
-    margin: 0; word-break: break-all; white-space: pre-wrap;
-    font-size: 12px;
-  }
+  .kv dd { margin: 0; word-break: break-all; white-space: pre-wrap; font-size: 12px; }
   #close { position: absolute; top: 14px; right: 16px; }
 </style>
 </head>
 <body>
 
 <header>
+  <span class="mark">E</span>
   <h1>EDR Collector</h1>
   <span class="meta"><span class="dot live" id="pulse"></span> <span id="updated">connecting</span></span>
   <span class="spacer"></span>
@@ -168,10 +242,13 @@
 
 <p id="banner"></p>
 
-<div class="tiles" id="tiles"></div>
+<div class="pad">
+  <div class="grid tiles" id="tiles"></div>
+  <div class="grid charts" id="charts"></div>
+</div>
 
 <div class="wrap">
-  <aside>
+  <aside class="card">
     <div class="side-h">Hosts</div>
     <div id="hosts"></div>
   </aside>
@@ -188,16 +265,19 @@
       <input id="q" placeholder="filter process, parent, path, user">
       <button id="all">Show INFO</button>
       <button id="clear">Clear host filter</button>
+      <span class="spacer"></span>
       <span class="meta" id="count"></span>
     </div>
-    <table>
-      <thead><tr>
-        <th>Received</th><th>Host</th><th>Sev</th><th>Process</th>
-        <th>Parent</th><th>UID</th><th>PID</th><th>Seq</th><th>Seal</th>
-      </tr></thead>
-      <tbody id="rows"></tbody>
-    </table>
-    <div class="empty" id="empty" hidden>No alerts in the current window.</div>
+    <div class="card tablecard">
+      <table>
+        <thead><tr>
+          <th>Received</th><th>Host</th><th>Sev</th><th>Process</th>
+          <th>Parent</th><th>UID</th><th>PID</th><th>Seq</th><th>Seal</th>
+        </tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div class="empty" id="empty" hidden>No alerts in the current window.</div>
+    </div>
   </main>
 </div>
 
@@ -226,14 +306,23 @@ const state = {
   all: false,      // include INFO
   auto: true,
   rows: [],
+  hosts: [],
 };
 
 const $ = (id) => document.getElementById(id);
+const CSSVAR = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
 function el(tag, cls, text) {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
   if (text !== undefined && text !== null) n.textContent = String(text);
+  return n;
+}
+
+const SVGNS = "http://www.w3.org/2000/svg";
+function svg(tag, attrs) {
+  const n = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
   return n;
 }
 
@@ -252,6 +341,157 @@ function ago(iso) {
   if (s < 3600) return Math.floor(s / 60) + "m ago";
   if (s < 86400) return Math.floor(s / 3600) + "h ago";
   return Math.floor(s / 86400) + "d ago";
+}
+
+// ---------- charts ----------
+
+// r chosen so the circumference is exactly 100 -- then stroke-dasharray is
+// literally "percent drawn, percent gap" and no arc maths is needed.
+const R = 15.9155;
+
+/* segs: [{label, value, color}]. Draws a donut plus a legend into `card`. */
+function donut(card, title, segs, centerLabel) {
+  const total = segs.reduce((a, s) => a + s.value, 0);
+
+  card.replaceChildren(el("div", "k", title));
+  const chart = el("div", "chart");
+  const s = svg("svg", { class: "donut", viewBox: "0 0 42 42" });
+
+  s.append(svg("circle", {
+    cx: 21, cy: 21, r: R, fill: "none",
+    stroke: CSSVAR("--panel-2"), "stroke-width": 4,
+  }));
+
+  let offset = 0;
+  const drawn = [];
+  for (const seg of segs) {
+    if (!seg.value) continue;
+    const pct = (seg.value / total) * 100;
+    const c = svg("circle", {
+      class: "seg", cx: 21, cy: 21, r: R, fill: "none",
+      stroke: seg.color, "stroke-width": 4, "stroke-linecap": "butt",
+      "stroke-dasharray": pct.toFixed(3) + " " + (100 - pct).toFixed(3),
+      // -25 puts the start of the ring at 12 o'clock instead of 3 o'clock.
+      "stroke-dashoffset": (25 - offset).toFixed(3),
+    });
+    // Native tooltip; setAttribute on <title> text is textContent, not markup.
+    c.append(Object.assign(svg("title"), { textContent: seg.label + ": " + seg.value }));
+    s.append(c);
+    drawn.push([c, pct]);
+    offset += pct;
+  }
+
+  const v = svg("text", { class: "ctr-v", x: 21, y: 20.6, "text-anchor": "middle" });
+  v.textContent = total;
+  const k = svg("text", { class: "ctr-k", x: 21, y: 25, "text-anchor": "middle" });
+  k.textContent = centerLabel.toUpperCase();
+  s.append(v, k);
+
+  const legend = el("div", "legend");
+  for (const seg of segs) {
+    const row = el("div", "lg");
+    const sw = el("span", "sw");
+    sw.style.background = seg.color;
+    sw.style.boxShadow = "0 0 8px -1px " + seg.color;
+    row.append(sw, el("span", "lb", seg.label), el("span", "nu", seg.value),
+               el("span", "pc", total ? Math.round((seg.value / total) * 100) + "%" : "—"));
+    legend.append(row);
+  }
+
+  chart.append(s, legend);
+  card.append(chart);
+
+  // Sweep the ring in on draw. Cheap, and it makes a changed mix obvious.
+  for (const [c, pct] of drawn) {
+    c.animate(
+      [{ strokeDasharray: "0 100" }, { strokeDasharray: pct.toFixed(3) + " " + (100 - pct).toFixed(3) }],
+      { duration: 550, easing: "cubic-bezier(.22,1,.36,1)" },
+    );
+  }
+}
+
+function barlist(card, title, pairs, color) {
+  card.replaceChildren(el("div", "k", title));
+  const box = el("div", "bars");
+  const max = pairs.length ? pairs[0][1] : 1;
+  for (const [name, n] of pairs) {
+    const row = el("div", "brow");
+    row.append(el("div", "nm", name), el("div", "ct", n));
+    const track = el("div", "track");
+    const fill = el("div", "fill");
+    fill.style.width = Math.max(3, (n / max) * 100) + "%";
+    fill.style.background = "linear-gradient(90deg," + color + "," + CSSVAR("--violet") + ")";
+    track.append(fill);
+    row.append(track);
+    box.append(row);
+  }
+  if (!pairs.length) box.append(el("div", "empty", "nothing yet"));
+  card.append(box);
+}
+
+/* Alert volume over the last hour, one point per minute. */
+function sparkline(mount) {
+  const now = Date.now(), bins = new Array(60).fill(0);
+  for (const r of state.rows) {
+    const t = new Date(r.received_at).getTime();
+    if (isNaN(t)) continue;
+    const m = Math.floor((now - t) / 60000);
+    if (m >= 0 && m < 60) bins[59 - m]++;
+  }
+  const max = Math.max(1, ...bins);
+  const s = svg("svg", { class: "spark", viewBox: "0 0 120 26", preserveAspectRatio: "none" });
+  const pts = bins.map((v, i) => (i * 120 / 59).toFixed(2) + "," + (25 - (v / max) * 23).toFixed(2));
+  const g = svg("linearGradient", { id: "sg", x1: 0, y1: 0, x2: 0, y2: 1 });
+  g.append(svg("stop", { offset: 0, "stop-color": CSSVAR("--accent"), "stop-opacity": .45 }),
+           svg("stop", { offset: 1, "stop-color": CSSVAR("--accent"), "stop-opacity": 0 }));
+  const defs = svg("defs"); defs.append(g);
+  s.append(defs,
+    svg("polygon", { points: "0,26 " + pts.join(" ") + " 120,26", fill: "url(#sg)" }),
+    svg("polyline", { points: pts.join(" "), fill: "none", stroke: CSSVAR("--accent"),
+                      "stroke-width": 1.4, "stroke-linejoin": "round" }));
+  mount.append(s);
+}
+
+function count(rows, key) {
+  const m = new Map();
+  for (const r of rows) {
+    const v = r[key];
+    if (!v) continue;
+    m.set(v, (m.get(v) || 0) + 1);
+  }
+  return [...m.entries()].sort((a, b) => b[1] - a[1]);
+}
+
+function renderCharts(fleet) {
+  const box = $("charts");
+  box.replaceChildren();
+  const mk = () => { const c = el("div", "card"); box.append(c); return c; };
+
+  const by = (s) => state.rows.filter((r) => (r.severity || "INFO") === s).length;
+  donut(mk(), "Severity mix · in view", [
+    { label: "CRITICAL", value: by("CRITICAL"), color: CSSVAR("--crit") },
+    { label: "HIGH",     value: by("HIGH"),     color: CSSVAR("--high") },
+    { label: "MEDIUM",   value: by("MEDIUM"),   color: CSSVAR("--med") },
+    { label: "INFO",     value: by("INFO"),     color: CSSVAR("--dim") },
+  ], "events");
+
+  const sealed = state.rows.filter((r) => r.verified).length;
+  donut(mk(), "Seal integrity · in view", [
+    { label: "MAC verified", value: sealed, color: CSSVAR("--ok") },
+    { label: "UNSEALED", value: state.rows.length - sealed, color: CSSVAR("--crit") },
+  ], "records");
+
+  const silent = state.hosts.filter((h) => h.silent).length;
+  const mism = state.hosts.filter((h) => h.build_mismatch && !h.silent).length;
+  donut(mk(), "Fleet health", [
+    { label: "Reporting", value: state.hosts.length - silent - mism, color: CSSVAR("--ok") },
+    { label: "Build mismatch", value: mism, color: CSSVAR("--high") },
+    { label: "Silent", value: silent, color: CSSVAR("--crit") },
+  ], "hosts");
+
+  barlist(mk(), "Top processes · in view",
+          count(state.rows.filter((r) => r.kind !== "collector"), "process_name").slice(0, 6),
+          CSSVAR("--accent"));
 }
 
 // ---------- rendering ----------
@@ -274,10 +514,15 @@ function renderTiles(fleet, hosts) {
   const box = $("tiles");
   box.replaceChildren();
   for (const [k, v, cls] of defs) {
-    const t = el("div", "tile");
+    const t = el("div", "card tile");
     t.append(el("div", "k", k), el("div", "v " + cls, v));
     box.append(t);
   }
+
+  const t = el("div", "card tile");
+  t.append(el("div", "k", "Alerts · last hour"));
+  sparkline(t);
+  box.append(t);
 }
 
 function renderBanner(fleet, hosts) {
@@ -434,9 +679,11 @@ async function refresh() {
     ]);
 
     state.rows = Array.isArray(al.alerts) ? al.alerts : [];
-    renderHosts(ov.hosts || []);
-    renderTiles(ov.fleet || {}, ov.hosts || []);
-    renderBanner(ov.fleet || {}, ov.hosts || []);
+    state.hosts = ov.hosts || [];
+    renderHosts(state.hosts);
+    renderTiles(ov.fleet || {}, state.hosts);
+    renderCharts(ov.fleet || {});
+    renderBanner(ov.fleet || {}, state.hosts);
     renderRows();
 
     $("updated").textContent = "updated " + shortTime(new Date().toISOString());

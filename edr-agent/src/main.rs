@@ -429,24 +429,94 @@ const PRIVESC: &[&str] = &["pkexec", "sudo", "su", "doas"];
 /// Reconnaissance tooling.
 const RECON: &[&str] = &["nmap", "masscan", "tcpdump", "nc", "ncat", "socat"];
 
-fn severity_for(process_name: &str, parent: &str, undecodable: bool) -> &'static str {
+/// World-writable directories that survive nothing and belong to nobody. A
+/// binary running from here was almost certainly dropped rather than installed.
+///
+/// Deliberately NOT including /home: on a developer box that is 14% of all
+/// execs (rustc, cargo, rust-analyzer) and the rule would be pure noise.
+const VOLATILE_DIRS: &[&str] = &["/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/", "/dev/mqueue/"];
+
+/// SEN-4 continued: `cmd` is the kernel's 15-char `comm`, and `filename` is the
+/// path that was actually loaded. The probe collects both precisely so they can
+/// be compared, which is the cheapest masquerade check there is.
+///
+/// ponytail: exact basename compare, no allowlist. Multi-call binaries (busybox,
+/// toybox) and some shebang chains legitimately diverge here and would need
+/// exempting; this machine's log has zero such records, so the exemption list
+/// does not exist yet. When it is needed it goes here, not in a config file.
+fn name_matches_path(process_name: &str, filename: &str) -> bool {
+    let base = filename.rsplit('/').next().unwrap_or("");
+    if base.is_empty() {
+        return true; // Nothing to compare against; not evidence of anything.
+    }
+    // comm is the basename truncated by the kernel at TASK_COMM_LEN-1 = 15
+    // bytes, so that prefix is the whole of what a match can be. Compared as
+    // bytes rather than chars: comm is bytes, and a multi-byte basename would
+    // panic a str slice on a boundary the kernel does not respect.
+    let n = base.len().min(15);
+    process_name.as_bytes() == &base.as_bytes()[..n]
+}
+
+/// A severity plus the name of the rule that produced it.
+///
+/// The rule name rides in the existing `event_type` field rather than a new one:
+/// `event_type` is already inside the MAC, so naming the rule costs nothing in
+/// `sealed_payload` or in verify.py's SEALED_FIELDS, and an analyst reading the
+/// record learns *why* it fired instead of only how loudly.
+pub struct Verdict {
+    pub severity: &'static str,
+    pub rule: &'static str,
+}
+
+const BENIGN: Verdict = Verdict { severity: "INFO", rule: "PROCESS_EXEC" };
+
+/// First match wins, so the rules are ordered most-severe first.
+pub fn classify(
+    process_name: &str,
+    parent: &str,
+    filename: &str,
+    undecodable: bool,
+) -> Verdict {
     if undecodable {
         // A name that is not valid UTF-8 is itself the finding.
-        return "HIGH";
+        return Verdict { severity: "HIGH", rule: "EXEC_UNDECODABLE_NAME" };
     }
     if TAMPER_TOOLS.contains(&process_name) {
-        return "CRITICAL";
+        return Verdict { severity: "CRITICAL", rule: "EXEC_TAMPER_TOOL" };
     }
     if NETWORK_SERVICES.contains(&parent) && SHELLS.contains(&process_name) {
-        return "CRITICAL";
+        return Verdict { severity: "CRITICAL", rule: "SERVICE_SPAWNED_SHELL" };
+    }
+    // The path still names the file, so the unlink happened after exec: someone
+    // is running code they already deleted from disk.
+    if filename.ends_with(" (deleted)") {
+        return Verdict { severity: "CRITICAL", rule: "EXEC_DELETED_BINARY" };
+    }
+    if VOLATILE_DIRS.iter().any(|d| filename.starts_with(d)) {
+        // A dropped payload is bad. A dropped payload that is a shell is a
+        // foothold.
+        return if SHELLS.contains(&process_name) {
+            Verdict { severity: "CRITICAL", rule: "VOLATILE_DIR_SHELL" }
+        } else {
+            Verdict { severity: "HIGH", rule: "EXEC_FROM_VOLATILE_DIR" }
+        };
     }
     if DESTRUCTIVE.contains(&process_name) || PRIVESC.contains(&process_name) {
-        return "HIGH";
+        return Verdict { severity: "HIGH", rule: "EXEC_PRIVESC_OR_DESTRUCTIVE" };
+    }
+    // Execution with no file behind it: memfd_create or an inherited fd. Note
+    // /proc/self/exe is explicitly NOT this -- that is ordinary re-exec, and it
+    // is 12 benign records in the sample log.
+    if filename.starts_with("/proc/self/fd/") || filename.contains("memfd:") {
+        return Verdict { severity: "MEDIUM", rule: "EXEC_FILELESS" };
     }
     if RECON.contains(&process_name) {
-        return "MEDIUM";
+        return Verdict { severity: "MEDIUM", rule: "EXEC_RECON_TOOL" };
     }
-    "INFO"
+    if !name_matches_path(process_name, filename) {
+        return Verdict { severity: "MEDIUM", rule: "EXEC_NAME_MISMATCH" };
+    }
+    BENIGN
 }
 
 // ---------------------------------------------------------
@@ -748,14 +818,15 @@ async fn main() -> Result<(), anyhow::Error> {
                     let (parent_process_name, parent_bad) = decode_name(&ev.pcomm);
                     let (filename, path_bad) = decode_name(&ev.filename);
 
-                    let severity = severity_for(
+                    let verdict = classify(
                         &process_name,
                         &parent_process_name,
+                        &filename,
                         name_bad || parent_bad || path_bad,
                     );
 
                     // Only pay for the /proc lookup on events that already matter.
-                    let binary_id = if severity == "INFO" {
+                    let binary_id = if verdict.severity == "INFO" {
                         String::new()
                     } else {
                         binary_identity(ev.pid)
@@ -767,8 +838,8 @@ async fn main() -> Result<(), anyhow::Error> {
                     let mut log = AgentLog {
                         timestamp: event_time.to_rfc3339(),
                         ktime_ns: ev.ktime_ns,
-                        severity: severity.to_string(),
-                        event_type: "PROCESS_EXEC".to_string(),
+                        severity: verdict.severity.to_string(),
+                        event_type: verdict.rule.to_string(),
                         uid: ev.uid,
                         pid: ev.pid,
                         ppid: ev.ppid,
@@ -1143,4 +1214,77 @@ async fn rotate_wal() -> Result<tokio::fs::File, anyhow::Error> {
     fs::rename(WAL_PATH, &archive)?;
     let (f, _) = open_wal_locked(WAL_PATH)?;
     Ok(tokio::fs::File::from_std(f))
+}
+
+// ---------------------------------------------------------
+// Tests
+// ---------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::{classify, name_matches_path};
+
+    /// (severity, rule) for a plain exec, so each case reads as one line.
+    fn c(name: &str, parent: &str, path: &str) -> (&'static str, &'static str) {
+        let v = classify(name, parent, path, false);
+        (v.severity, v.rule)
+    }
+
+    #[test]
+    fn ordinary_exec_is_quiet() {
+        assert_eq!(c("ls", "bash", "/usr/bin/ls"), ("INFO", "PROCESS_EXEC"));
+        assert_eq!(c("rustc", "cargo", "/home/u/.cargo/bin/rustc").0, "INFO");
+    }
+
+    #[test]
+    fn dropped_payloads() {
+        assert_eq!(c("t", "bash", "/tmp/t"), ("HIGH", "EXEC_FROM_VOLATILE_DIR"));
+        assert_eq!(c("sh", "bash", "/tmp/x"), ("CRITICAL", "VOLATILE_DIR_SHELL"));
+        assert_eq!(c("x", "bash", "/dev/shm/x").0, "HIGH");
+        // A path merely containing /tmp/ is not a path starting with it.
+        assert_eq!(c("cfg", "bash", "/opt/tmp/cfg").0, "INFO");
+    }
+
+    #[test]
+    fn deleted_binary_outranks_its_directory() {
+        assert_eq!(
+            c("s", "bash", "/tmp/s (deleted)"),
+            ("CRITICAL", "EXEC_DELETED_BINARY")
+        );
+    }
+
+    /// The exclusion most likely to regress: /proc/self/exe is ordinary
+    /// re-exec (12 benign records in the sample log), not fileless execution.
+    #[test]
+    fn proc_self_exe_is_not_fileless() {
+        assert_eq!(c("exe", "bash", "/proc/self/exe").0, "INFO");
+        assert_eq!(c("18", "bash", "/proc/self/fd/18"), ("MEDIUM", "EXEC_FILELESS"));
+        assert_eq!(c("x", "bash", "/memfd:x (deleted)").0, "CRITICAL");
+    }
+
+    #[test]
+    fn masquerade() {
+        assert_eq!(c("nginx", "bash", "/usr/bin/xmrig"), ("MEDIUM", "EXEC_NAME_MISMATCH"));
+        // comm is truncated at 15 bytes, so a long basename matching in its
+        // first 15 is a match, not a mismatch.
+        assert!(name_matches_path("rust-analyzer-p", "/usr/lib/rust-analyzer-proc-macro-srv"));
+        assert!(!name_matches_path("rust-analyzer-X", "/usr/lib/rust-analyzer-proc-macro-srv"));
+        // Exactly 15 vs 16: the boundary itself.
+        assert!(name_matches_path("abcdefghijklmno", "/b/abcdefghijklmnop"));
+        assert!(name_matches_path("short", "/b/short"));
+        assert!(!name_matches_path("shor", "/b/short"));
+    }
+
+    #[test]
+    fn undecodable_name_wins_over_everything() {
+        let v = classify("hex:ff", "bash", "/usr/bin/ls", true);
+        assert_eq!((v.severity, v.rule), ("HIGH", "EXEC_UNDECODABLE_NAME"));
+    }
+
+    #[test]
+    fn existing_rules_still_fire() {
+        assert_eq!(c("bpftool", "bash", "/usr/bin/bpftool").0, "CRITICAL");
+        assert_eq!(c("sh", "nginx", "/usr/bin/sh").0, "CRITICAL");
+        assert_eq!(c("sudo", "fish", "/usr/bin/sudo").0, "HIGH");
+        assert_eq!(c("nmap", "bash", "/usr/bin/nmap").0, "MEDIUM");
+    }
 }

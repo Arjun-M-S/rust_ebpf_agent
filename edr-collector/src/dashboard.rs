@@ -73,6 +73,12 @@ async fn page() -> impl IntoResponse {
                 header::CONTENT_SECURITY_POLICY,
                 HeaderValue::from_static(CSP),
             ),
+            // The page ships inside the binary, so a cached copy is a copy of
+            // an older build. Never keep it.
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store"),
+            ),
             (
                 header::X_CONTENT_TYPE_OPTIONS,
                 HeaderValue::from_static("nosniff"),

@@ -20,14 +20,28 @@ fn main() {
     // outside cargo, which is not a supported path.
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
 
+    // A nested `cargo build` inherits the outer cargo's target dir by default,
+    // which means it fights the outer process for the same target/.cargo-lock
+    // and deadlocks: the parent holds the lock until this build script exits,
+    // and this build script can't exit until the child gets the lock it's
+    // waiting on. A separate --target-dir sidesteps the shared lock entirely.
+    let bpf_target_dir = workspace_root.join("target/bpf-build");
+
     let status = Command::new(&cargo)
         .current_dir(&workspace_root)
         .args(&[
             "build",
             "--package", "edr-agent-ebpf",
             "--target", "bpfel-unknown-none",
+            "--target-dir", bpf_target_dir.to_str().unwrap(),
             "-Z", "build-std=core",
-            "--release" 
+            // LLVM lowers a large enough struct initialisation to a memset
+            // call, and the BPF backend rejects calls to builtins it cannot
+            // resolve: "A call to built-in function 'memset' is not supported".
+            // compiler_builtins' `mem` feature supplies real definitions, which
+            // bpf-linker then exports, so the call resolves instead of failing.
+            "-Z", "build-std-features=compiler-builtins-mem",
+            "--release"
         ])
         .status()
         .expect("Failed to run cargo build for eBPF");
@@ -36,9 +50,8 @@ fn main() {
         panic!("Failed to build eBPF program");
     }
 
-    // 3. Locate the compiled binary (Standard Rust location)
-    let bpf_binary = workspace_root
-        .join("target/bpfel-unknown-none/release/edr-agent-ebpf");
+    // 3. Locate the compiled binary
+    let bpf_binary = bpf_target_dir.join("bpfel-unknown-none/release/edr-agent-ebpf");
 
     // 4. Copy it to the build output directory so we can access it easily
     let dest_path = out_dir.join("edr-agent-ebpf");
@@ -62,7 +75,7 @@ fn main() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if let Ok(md) = fs::metadata(workspace_root.join("target")) {
+        if let Ok(md) = fs::metadata(&bpf_target_dir) {
             if md.mode() & 0o022 != 0 {
                 println!(
                     "cargo:warning=target/ is group- or world-writable (mode {:o}). \
