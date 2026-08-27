@@ -1,0 +1,18 @@
+# The wire contract between the two standalone components: the agent (which
+# seals records) and the collector (which verifies and stores them). Both
+# path-depend on this crate, so the encoding the MAC covers has exactly one
+# definition and cannot drift between the halves.
+#
+# Deliberately dependency-light and userspace-only. The eBPF crate never sees
+# it; the kernel <-> userspace ABI lives in agent/edr-agent-common instead.
+[package]
+name = "edr-record"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"

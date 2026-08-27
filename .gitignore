@@ -14,5 +14,5 @@ target/
 *.state.json
 *.key
 *.pem
-/data
+data/
 edr.wal*

@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-edr-agent-common = { path = "../edr-agent-common", features = ["user"] }
+edr-record = { workspace = true }
 
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "fs", "signal", "time", "sync"] }

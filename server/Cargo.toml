@@ -1,0 +1,28 @@
+# The server half. Builds, tests and ships without the agent tree: stable
+# toolchain, no eBPF, no nightly, no root.
+#
+#     cd server && cargo build --release && cargo test
+[workspace]
+resolver = "2"
+members = ["edr-collector"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+edr-record = { path = "../protocol" }
+anyhow = { version = "1", default-features = false }
+clap = { version = "4", default-features = false, features = ["std"] }
+env_logger = { version = "0.11", default-features = false }
+tokio = { version = "1", default-features = false }
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+panic = "abort"

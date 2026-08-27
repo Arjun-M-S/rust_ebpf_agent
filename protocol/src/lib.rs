@@ -1,8 +1,9 @@
 //! The sealed record format: written by the agent, verified by the collector,
 //! mirrored by verify.py.
 //!
-//! This lives in the shared crate rather than in the agent because the exact
-//! bytes covered by the MAC now matter to three separate programs. Three
+//! This is its own crate, outside both the agent and the server workspaces,
+//! because the exact bytes covered by the MAC matter to three separate
+//! programs and belong to none of them. Three
 //! independent copies of that encoding is three chances to drift apart, and the
 //! failure mode of drift is every record failing to verify for a reason nobody
 //! can locate. verify.py is the one copy that cannot be shared; its `SEALED_FIELDS`

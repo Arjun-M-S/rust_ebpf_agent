@@ -6,7 +6,7 @@ use aya_log::EbpfLogger;
 use bytes::BytesMut;
 use chrono::{DateTime, Local};
 use clap::Parser;
-use edr_agent_common::record::{record_mac, verify_record, AgentLog, GENESIS_MAC};
+use edr_record::{record_mac, verify_record, AgentLog, GENESIS_MAC};
 use edr_agent_common::ProcessEvent;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
@@ -52,9 +52,10 @@ const FLUSH_INTERVAL_MS: u64 = 200;
 const HEALTH_INTERVAL_SECS: u64 = 30;
 const CHANNEL_CAPACITY: usize = 4096;
 
-// The record format, the payload encoding and the key schedule all live in
-// edr-agent-common::record so the collector verifies exactly what the agent
-// sealed. Do not reintroduce a local copy.
+// The record format, the payload encoding and the key schedule all live in the
+// `edr-record` crate (../../protocol), which the collector depends on too, so it
+// verifies exactly what the agent sealed. That crate is the entire contract
+// between the two components. Do not reintroduce a local copy.
 
 #[derive(Debug, Parser)]
 struct Opt {

@@ -35,9 +35,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use edr_agent_common::record::{
-    derive_epoch_key, evolve_key, parse_key, verify_record, AgentLog, GENESIS_MAC,
-};
+use edr_record::{derive_epoch_key, evolve_key, parse_key, verify_record, AgentLog, GENESIS_MAC};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -966,7 +964,7 @@ async fn main() -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use edr_agent_common::record::record_mac;
+    use edr_record::record_mac;
 
     fn seal(key: &[u8; 32], seq: u64, epoch: u64, prev: &str) -> AgentLog {
         let mut log = AgentLog {

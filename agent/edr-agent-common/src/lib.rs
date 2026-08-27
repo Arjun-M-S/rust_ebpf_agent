@@ -1,10 +1,8 @@
-// no_std for the kernel side. The `user` feature adds std and the sealed record
-// format, which the agent and the collector both need and the eBPF probe must
-// never see.
-#![cfg_attr(not(feature = "user"), no_std)]
-
-#[cfg(feature = "user")]
-pub mod record;
+// The kernel <-> userspace ABI, and nothing else. Always no_std: the eBPF probe
+// compiles this crate, so anything that pulls in std or a dependency does not
+// belong here. The sealed record format lives in the `edr-record` crate
+// (../../protocol), shared with the collector.
+#![no_std]
 
 /// The kernel <-> userspace ABI. Both sides must agree byte-for-byte.
 ///

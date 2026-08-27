@@ -1,12 +1,16 @@
+# The agent half. Needs nightly + bpf-linker for the eBPF crate and root to
+# run; none of that is the server's problem, which is why it has its own
+# workspace, its own lockfile and its own .cargo/config.toml.
+#
+#     cd agent && cargo build --release
 [workspace]
 resolver = "2"
 members = [
     "edr-agent",
     "edr-agent-common",
     "edr-agent-ebpf",
-    "edr-collector",
 ]
-default-members = ["edr-agent", "edr-agent-common", "edr-collector"]
+default-members = ["edr-agent", "edr-agent-common"]
 
 [workspace.package]
 version = "0.1.0"
@@ -19,6 +23,10 @@ aya = { version = "0.13", default-features = false }
 aya-ebpf = { version = "0.1", default-features = false }      
 aya-log = { version = "0.2", default-features = false }
 aya-log-ebpf = { version = "0.1", default-features = false }
+
+# The wire contract shared with the server half. Lives outside this workspace
+# on purpose: neither component owns it.
+edr-record = { path = "../protocol" }
 
 # --- UTILS ---
 anyhow = { version = "1", default-features = false }

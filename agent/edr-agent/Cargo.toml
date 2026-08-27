@@ -6,7 +6,8 @@ publish = false
 
 [dependencies]
 # Internal
-edr-agent-common = { path = "../edr-agent-common", features = ["user"] }
+edr-agent-common = { path = "../edr-agent-common" }   # kernel <-> userspace ABI
+edr-record = { workspace = true }                     # wire format, shared with the server
 # Aya (Stable uses 'async_tokio')
 aya = { workspace = true, features = ["async_tokio"] }
 aya-log = { workspace = true }

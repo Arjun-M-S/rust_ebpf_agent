@@ -1,0 +1,10 @@
+[package]
+name = "edr-agent-common"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The kernel <-> userspace ABI only, so it stays no_std with no dependencies at
+# all. The sealed record format used to live here behind a `user` feature; it is
+# now ../../protocol, because the server needs it and the kernel never did.
+[dependencies]

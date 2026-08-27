@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-edr-agent-common = { path = "../edr-agent-common", features = ["kernel"] }
+edr-agent-common = { path = "../edr-agent-common" }
 aya-ebpf = { workspace = true }
 aya-log-ebpf = { workspace = true }
 

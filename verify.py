@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline verifier for the agent's forward-secure sealed log.
 
-Must mirror `sealed_payload()` and `Sealer` in edr-agent/src/main.rs
+Must mirror `sealed_payload()` and `Sealer` in agent/edr-agent/src/main.rs
 byte-for-byte. If the two ever drift, every record fails.
 
 The agent prints K0 once, at first start. Without it held off the monitored
@@ -33,7 +33,7 @@ DEFAULT_WAL = "/var/log/edr/edr.wal"
 # Order is load-bearing. This is the exact field sequence in sealed_payload().
 # Ceiling on epochs of key evolution to derive for one record. 60s epochs, so
 # ~2 years of continuous uptime. Keep in step with MAX_EPOCH_WALK in
-# edr-collector/src/main.rs.
+# server/edr-collector/src/main.rs.
 MAX_EPOCH_WALK = 1_051_200
 
 SEALED_FIELDS = [
