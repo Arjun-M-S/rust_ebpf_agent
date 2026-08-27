@@ -35,7 +35,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use edr_record::{derive_epoch_key, evolve_key, parse_key, verify_record, AgentLog, GENESIS_MAC};
+use edr_record::{
+    derive_epoch_key, evolve_key, merkle, parse_key, verify_record, AgentLog, GENESIS_MAC,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -80,6 +82,11 @@ enum Command {
         /// shedding here costs latency and nothing else.
         #[arg(long, default_value_t = 32)]
         max_concurrent_ingest: usize,
+        /// Seal a Merkle batch per accepted POST. Off stores records exactly as
+        /// before but commits to nothing, so proofs cannot be issued for
+        /// anything ingested while it was off.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        merkle: bool,
         /// Where to serve the read-only dashboard. Deliberately a SEPARATE
         /// socket from --listen: the ingest port must be reachable by the
         /// proxy, and the proxy is not trusted. Sharing one port would let it
@@ -147,6 +154,20 @@ struct HostState {
     /// bury the event it is meant to surface.
     #[serde(default)]
     last_build: Option<String>,
+    /// Next batch_id for this host. Dense, starts at 0.
+    ///
+    /// This and the two below are #[serde(default)] so a state file written
+    /// before Merkle batching existed still loads and simply starts at batch 0.
+    #[serde(default)]
+    batches: u64,
+    /// Previous batch's chainhash, GENESIS_MAC when there is none. Chains
+    /// batches the way prev_hash chains records, so deleting a whole batch line
+    /// is visible without reaching for the on-chain root.
+    #[serde(default)]
+    last_chainhash: String,
+    /// Highest seq covered by a sealed batch.
+    #[serde(default)]
+    last_committed_seq: u64,
 }
 
 /// Stored form. The sealed record is kept byte-identical inside `record` so it
@@ -214,9 +235,131 @@ struct Host {
     state: HostState,
 }
 
+// ---------------------------------------------------------
+// Merkle batching (server.md 2.4 / 2.5)
+// ---------------------------------------------------------
+
+/// One line of `batches/{host}.ndjson`: the commitment to exactly one accepted
+/// POST.
+///
+/// Strictly append-only, like the events file. Nothing here is ever patched in
+/// place -- notably there is no `root_id` field, because the batch -> root
+/// mapping lives in the root line instead. A file that is only ever appended to
+/// is one whose tampering shows up in its size and its chain links alone.
+#[derive(Serialize, Deserialize)]
+struct BatchLine {
+    v: u32,
+    batch_id: u64,
+    host: String,
+    sealed_at: String,
+    chainhash: String,
+    prev_chainhash: String,
+    count: u32,
+    /// Records only. A markers-only batch has no seq, and both are 0.
+    seq_lo: u64,
+    seq_hi: u64,
+    segment: u64,
+    /// The exact byte range this batch appended to `events/{host}.ndjson`.
+    ///
+    /// Committing to bytes rather than to sequence numbers is what makes the
+    /// design immune to duplicate lines: if a retry appends the same records
+    /// twice, the second copy is simply bytes no batch names.
+    byte_start: u64,
+    byte_end: u64,
+    /// Every leaf hash in order. ~64 hex bytes per ~370-byte record is about
+    /// 17% storage overhead, and it buys proof generation with two file reads
+    /// and no re-hashing of the events file.
+    ///
+    /// ponytail: stored rather than recomputed. Drop it and re-derive from the
+    /// byte range if the overhead ever matters more than proof latency.
+    leaves: Vec<String>,
+}
+
+/// What the in-memory index keeps per batch. Deliberately not the leaves --
+/// only where to find them.
+///
+/// Populated here rather than in the step that reads it, because filling it is
+/// an ingest-path concern: the entry has to be pushed under the same lock that
+/// appended the batch. `merkle-audit` (step 6) and the retrieval API (step 8)
+/// are the readers.
+#[allow(dead_code)]
+#[derive(Clone)]
+struct BatchIndexEntry {
+    batch_id: u64,
+    seq_lo: u64,
+    seq_hi: u64,
+    segment: u64,
+    byte_start: u64,
+    byte_end: u64,
+    count: u32,
+    sealed_at: String,
+    /// Byte offset of this line within `batches/{host}.ndjson`, so serving a
+    /// proof reads one line instead of the whole file.
+    line_offset: u64,
+}
+
+/// Cross-host Merkle state. The one thing here that is genuinely shared, and so
+/// the one place many agents contend.
+///
+/// ponytail: rebuilt by a full scan at startup. At 500 records per batch, a
+/// year of one busy host is ~60k lines -- fine to walk. Add a checkpoint file
+/// if boot time ever becomes noticeable.
+#[derive(Default)]
+struct MerkleIndex {
+    /// Per host, ordered by batch_id, which is also insertion order.
+    batches: HashMap<String, Vec<BatchIndexEntry>>,
+}
+
+impl MerkleIndex {
+    /// Single sequential pass over every `batches/*.ndjson` at startup.
+    fn load(dir: &Path) -> Self {
+        let mut index = MerkleIndex::default();
+        let Ok(entries) = std::fs::read_dir(dir.join("batches")) else {
+            return index;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(host) = name.strip_suffix(".ndjson") else {
+                continue;
+            };
+            let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+                eprintln!("CRITICAL: could not read batch index for {}", host);
+                continue;
+            };
+            let mut offset = 0u64;
+            let mut list = Vec::new();
+            for line in raw.split_inclusive('\n') {
+                let start = offset;
+                offset = offset.saturating_add(line.len() as u64);
+                let Ok(b) = serde_json::from_str::<BatchLine>(line.trim_end()) else {
+                    if !line.trim().is_empty() {
+                        eprintln!("CRITICAL: unparseable batch line for {} at byte {}", host, start);
+                    }
+                    continue;
+                };
+                list.push(BatchIndexEntry {
+                    batch_id: b.batch_id,
+                    seq_lo: b.seq_lo,
+                    seq_hi: b.seq_hi,
+                    segment: b.segment,
+                    byte_start: b.byte_start,
+                    byte_end: b.byte_end,
+                    count: b.count,
+                    sealed_at: b.sealed_at,
+                    line_offset: start,
+                });
+            }
+            if !list.is_empty() {
+                index.batches.insert(host.to_string(), list);
+            }
+        }
+        index
+    }
+}
+
 /// LOCK ORDER -- exactly one order is legal, and every handler must obey it:
 ///
-///     app.hosts (registry)  ->  Host (per-host)  ->  [future: merkle index]
+///     app.hosts (registry)  ->  Host (per-host)  ->  app.merkle (index)
 ///
 /// Violating it deadlocks the collector, and `panic = "abort"` means a
 /// deadlocked collector blinds the whole fleet. The rules that keep the graph
@@ -225,8 +368,14 @@ struct Host {
 ///   * The registry guard is held only long enough to clone an `Arc`. Never
 ///     across file I/O, never across a network call, never across `.await` on
 ///     another lock. A miss drops the guard, loads from disk, then re-acquires.
-///   * `ingest`: registry (brief) -> host. The host guard IS held across the
-///     append `.await`, which is why these are tokio mutexes and not std ones.
+///   * `ingest`: registry (brief) -> host -> merkle (brief). The host guard IS
+///     held across the append `.await`, which is why these are tokio mutexes
+///     and not std ones.
+///   * Critical sections on `merkle` are pure in-memory work: no file I/O, no
+///     hashing of a whole batch, no `.await` on anything but the lock. It is
+///     the one lock every host touches, so anything slow held under it
+///     reintroduces exactly the fleet-wide serialisation the per-host split
+///     removed.
 ///   * readers (`status`, dashboard): clone names + Arcs under the registry
 ///     guard, drop it, then take each host lock one at a time.
 ///   * `watch_for_silence`: same -- one host at a time, releasing between.
@@ -251,6 +400,11 @@ struct App {
     /// bodies of up to MAX_BODY_BYTES each; unbounded, that is an OOM, and a
     /// `panic = "abort"` build turns an OOM into a fleet-wide blackout.
     ingest_permits: Arc<tokio::sync::Semaphore>,
+    /// Cross-host Merkle state. Its own lock, taken last and briefly.
+    merkle: Mutex<MerkleIndex>,
+    /// Whether to seal batches at all. A kill switch for a feature that writes
+    /// on the ingest path; ingest keeps working with it off, just uncommitted.
+    merkle_enabled: bool,
 }
 
 /// How long a "not enrolled" answer stays cached. One minute: long enough that
@@ -320,11 +474,18 @@ impl App {
     }
 
     fn new(data_dir: PathBuf, max_concurrent_ingest: usize) -> Self {
+        App::with_merkle(data_dir, max_concurrent_ingest, true)
+    }
+
+    fn with_merkle(data_dir: PathBuf, max_concurrent_ingest: usize, merkle_enabled: bool) -> Self {
+        let merkle = MerkleIndex::load(&data_dir);
         App {
             data_dir,
             hosts: Mutex::new(HashMap::new()),
             unenrolled: Mutex::new(HashMap::new()),
             ingest_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_ingest)),
+            merkle: Mutex::new(merkle),
+            merkle_enabled,
         }
     }
 
@@ -350,6 +511,14 @@ fn state_path(dir: &Path, host: &str) -> PathBuf {
 
 fn events_path(dir: &Path, host: &str) -> PathBuf {
     dir.join("events").join(format!("{}.ndjson", host))
+}
+
+fn hex_string(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn batches_path(dir: &Path, host: &str) -> PathBuf {
+    dir.join("batches").join(format!("{}.ndjson", host))
 }
 
 /// Host ids become filenames, so anything that could climb out of the data
@@ -478,6 +647,18 @@ fn check_record(state: &HostState, keys: &mut HostKeys, rec: &AgentLog) -> Optio
     None
 }
 
+/// Push one line into the batch, and its leaf, together.
+///
+/// The single most breakable invariant in the Merkle layer is that
+/// `pending_leaves[i]` is the leaf of the i-th line appended to the events
+/// file. Every commit goes through this one function so a line type cannot be
+/// added to one and forgotten in the other.
+fn commit_line(out: &mut String, leaves: &mut Vec<[u8; 32]>, json: &str, leaf: [u8; 32]) {
+    out.push_str(json);
+    out.push('\n');
+    leaves.push(leaf);
+}
+
 async fn ingest(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -512,6 +693,12 @@ async fn ingest(
     let now: DateTime<Utc> = Utc::now();
     let mut out = String::with_capacity(body.len() + 256);
     let mut first_error: Option<String> = None;
+    // Leaf per committed line, in append order. Empty means nothing was
+    // stored, which means nothing is sealed -- an idempotent replay writes no
+    // batch line at all.
+    let mut pending_leaves: Vec<[u8; 32]> = Vec::new();
+    let mut seq_lo = 0u64;
+    let mut seq_hi = 0u64;
 
     // SUP-2: the agent reports the identity of the binary that is running. A
     // stub that heartbeats and reports nothing is otherwise indistinguishable
@@ -541,8 +728,8 @@ async fn ingest(
                 "detail": "the agent binary does not match the one enrolled for this host",
             });
             if let Ok(s) = serde_json::to_string(&marker) {
-                out.push_str(&s);
-                out.push('\n');
+                let leaf = merkle::marker_leaf(s.as_bytes());
+                commit_line(&mut out, &mut pending_leaves, &s, leaf);
             }
             if first_error.is_none() {
                 first_error = Some("agent binary does not match enrollment".to_string());
@@ -604,8 +791,8 @@ async fn ingest(
                 "detail": detail,
             });
             if let Ok(s) = serde_json::to_string(&marker) {
-                out.push_str(&s);
-                out.push('\n');
+                let leaf = merkle::marker_leaf(s.as_bytes());
+                commit_line(&mut out, &mut pending_leaves, &s, leaf);
             }
         }
 
@@ -620,8 +807,17 @@ async fn ingest(
             record: &rec,
         };
         if let Ok(s) = serde_json::to_string(&stored) {
-            out.push_str(&s);
-            out.push('\n');
+            // The record leaf commits to sealed_payload || raw(hash) -- the
+            // agent's bytes only -- so a third party holding just the record can
+            // recompute it. A record whose hash is not 32 raw bytes cannot have
+            // verified; it is committed over its stored line instead, which at
+            // least pins the evidence.
+            let leaf = merkle::record_leaf(&rec).unwrap_or_else(|| merkle::marker_leaf(s.as_bytes()));
+            if seq_lo == 0 {
+                seq_lo = rec.seq;
+            }
+            seq_hi = rec.seq;
+            commit_line(&mut out, &mut pending_leaves, &s, leaf);
         }
 
         entry.state.high_seq = rec.seq;
@@ -643,7 +839,10 @@ async fn ingest(
         // This host's guard IS held across the await, deliberately: two POSTs
         // for one host must not interleave their bytes. Other hosts are
         // unaffected, which is the whole point of the per-host lock.
-        let append = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        // Returns the byte range this append occupies. byte_start is read
+        // from the open file under this host's lock, so two writers to one
+        // host cannot both claim the same offset.
+        let append = tokio::task::spawn_blocking(move || -> std::io::Result<(u64, u64)> {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -651,18 +850,20 @@ async fn ingest(
                 .create(true)
                 .append(true)
                 .open(&path)?;
+            let byte_start = f.metadata()?.len();
             f.write_all(bytes.as_bytes())?;
-            f.sync_all()
+            f.sync_all()?;
+            Ok((byte_start, byte_start.saturating_add(bytes.len() as u64)))
         })
         .await;
 
         // A JoinError means the blocking task panicked or was cancelled. Treat
         // it exactly like a write failure: nothing is known to be on disk, so
         // nothing may be acked. Never unwrap the join (PANIC POLICY).
-        let failure = match append {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(e.to_string()),
-            Err(join) => Some(format!("append task did not complete: {}", join)),
+        let (failure, range) = match append {
+            Ok(Ok(range)) => (None, Some(range)),
+            Ok(Err(e)) => (Some(e.to_string()), None),
+            Err(join) => (Some(format!("append task did not complete: {}", join)), None),
         };
 
         if let Some(e) = failure {
@@ -678,6 +879,135 @@ async fn ingest(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"acked_seq": acked, "error": "storage write failed"})),
             );
+        }
+
+        // Only now that the events bytes are durable is there anything to
+        // commit to. Sealing before the append would commit to bytes that may
+        // never exist.
+        //
+        // If this batch write fails, state rolls back to pre_batch and nothing
+        // is acked -- even though the events bytes ARE on disk. That is
+        // deliberate, and it is not a leak: the agent retries, the retried
+        // records get appended a second time, and the second attempt commits
+        // those bytes. The orphaned first copy is uncommitted bytes that no
+        // batch line names, which is harmless precisely because batches commit
+        // to byte ranges rather than to sequence numbers. Do not "fix" this
+        // into acking a batch whose commitment was never written.
+        // Both emptiness checks are redundant with `if !out.is_empty()` above,
+        // since commit_line pushes a line and its leaf together and nothing
+        // else writes to `out`. Kept as belt and braces on the invariant that
+        // matters most here: never seal a batch that commits to no bytes.
+        if app.merkle_enabled && !pending_leaves.is_empty() {
+            let Some((byte_start, byte_end)) = range else {
+                eprintln!("CRITICAL: events for {} were appended without a byte range", host);
+                let acked = pre_batch.high_seq;
+                entry.state = pre_batch;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"acked_seq": acked, "error": "storage write failed"})),
+                );
+            };
+
+            let batch_id = entry.state.batches;
+            let prev_chainhash = if entry.state.last_chainhash.is_empty() {
+                GENESIS_MAC.to_string()
+            } else {
+                entry.state.last_chainhash.clone()
+            };
+            // One SHA-256 per record plus n-1 for the tree: microseconds for a
+            // 500-record batch, against two fsyncs in the same section.
+            let chainhash = merkle::root(&pending_leaves);
+            let chainhash_hex = hex_string(&chainhash);
+
+            let line = BatchLine {
+                v: 1,
+                batch_id,
+                host: host.clone(),
+                sealed_at: now.to_rfc3339(),
+                chainhash: chainhash_hex.clone(),
+                prev_chainhash,
+                count: pending_leaves.len().min(u32::MAX as usize) as u32,
+                seq_lo,
+                seq_hi,
+                segment: entry.state.segment,
+                byte_start,
+                byte_end,
+                leaves: pending_leaves.iter().map(hex_string).collect(),
+            };
+
+            let Ok(mut encoded) = serde_json::to_string(&line) else {
+                eprintln!("CRITICAL: could not serialize batch {} for {}", batch_id, host);
+                let acked = pre_batch.high_seq;
+                entry.state = pre_batch;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"acked_seq": acked, "error": "batch commit failed"})),
+                );
+            };
+            encoded.push('\n');
+
+            let bpath = batches_path(&app.data_dir, &host);
+            let written = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+                if let Some(parent) = bpath.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&bpath)?;
+                let line_offset = f.metadata()?.len();
+                f.write_all(encoded.as_bytes())?;
+                f.sync_all()?;
+                Ok(line_offset)
+            })
+            .await;
+
+            let line_offset = match written {
+                Ok(Ok(offset)) => offset,
+                Ok(Err(e)) => {
+                    eprintln!("CRITICAL: could not commit batch {} for {}: {}", batch_id, host, e);
+                    let acked = pre_batch.high_seq;
+                    entry.state = pre_batch;
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"acked_seq": acked, "error": "batch commit failed"})),
+                    );
+                }
+                Err(join) => {
+                    eprintln!("CRITICAL: batch commit task for {} did not complete: {}", host, join);
+                    let acked = pre_batch.high_seq;
+                    entry.state = pre_batch;
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"acked_seq": acked, "error": "batch commit failed"})),
+                    );
+                }
+            };
+
+            entry.state.batches = batch_id.saturating_add(1);
+            entry.state.last_chainhash = chainhash_hex;
+            entry.state.last_committed_seq = seq_hi.max(entry.state.last_committed_seq);
+
+            // Still under this host's lock, take the index lock -- host then
+            // merkle, never the reverse -- and release it immediately. Pure
+            // in-memory work only.
+            app.merkle
+                .lock()
+                .await
+                .batches
+                .entry(host.clone())
+                .or_default()
+                .push(BatchIndexEntry {
+                    batch_id,
+                    seq_lo,
+                    seq_hi,
+                    segment: line.segment,
+                    byte_start,
+                    byte_end,
+                    count: line.count,
+                    sealed_at: line.sealed_at,
+                    line_offset,
+                });
         }
     }
 
@@ -1055,6 +1385,7 @@ async fn main() -> Result<(), anyhow::Error> {
             listen,
             silence_secs,
             max_concurrent_ingest,
+            merkle,
             dashboard_listen,
         } => {
             std::fs::create_dir_all(cli.data_dir.join("hosts"))?;
@@ -1062,7 +1393,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
             // A zero here would wedge ingest permanently, so it is floored.
             let permits = max_concurrent_ingest.max(1);
-            let app = Arc::new(App::new(cli.data_dir.clone(), permits));
+            let app = Arc::new(App::with_merkle(cli.data_dir.clone(), permits, merkle));
+            let indexed: usize = app.merkle.lock().await.batches.values().map(Vec::len).sum();
 
             // Warm the registry so `status` and silence detection see hosts
             // that have not reported since this process started.
@@ -1124,8 +1456,13 @@ async fn main() -> Result<(), anyhow::Error> {
             let listener = tokio::net::TcpListener::bind(&listen).await?;
             eprintln!(
                 "edr-collector listening on {} | {} host(s) enrolled | data {:?} | \
-                 {} concurrent ingest",
-                listen, enrolled, cli.data_dir, permits
+                 {} concurrent ingest | merkle {} ({} batches indexed)",
+                listen,
+                enrolled,
+                cli.data_dir,
+                permits,
+                if merkle { "on" } else { "off" },
+                indexed
             );
             eprintln!(
                 "NOTE: plain HTTP. Terminate TLS in front of this and bind it to localhost."
@@ -1318,7 +1655,7 @@ mod tests {
 // Every test runs under a wall-clock timeout. A lock inversion should fail CI
 // in seconds rather than hang it until the job is killed.
 #[cfg(test)]
-mod concurrency_tests {
+pub(crate) mod concurrency_tests {
     use super::*;
     use edr_record::record_mac;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1327,7 +1664,7 @@ mod concurrency_tests {
     const DEADLOCK_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// A data dir that removes itself. No tempfile dependency for four lines.
-    struct TempDir(PathBuf);
+    pub(crate) struct TempDir(pub(crate) PathBuf);
 
     impl Drop for TempDir {
         fn drop(&mut self) {
@@ -1335,7 +1672,7 @@ mod concurrency_tests {
         }
     }
 
-    fn temp_dir() -> TempDir {
+    pub(crate) fn temp_dir() -> TempDir {
         static N: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "edr-collector-test-{}-{}",
@@ -1347,7 +1684,7 @@ mod concurrency_tests {
         TempDir(dir)
     }
 
-    fn enroll_for_test(dir: &Path, host: &str, k0: &[u8; 32]) {
+    pub(crate) fn enroll_for_test(dir: &Path, host: &str, k0: &[u8; 32]) {
         let enrollment = Enrollment {
             k0: hex_of(k0),
             build_id: None,
@@ -1357,11 +1694,11 @@ mod concurrency_tests {
         write_atomic(&enroll_path(dir, host), &json).expect("enrollment written");
     }
 
-    fn hex_of(bytes: &[u8; 32]) -> String {
+    pub(crate) fn hex_of(bytes: &[u8; 32]) -> String {
         bytes.iter().map(|b| format!("{:02x}", b)).collect()
     }
 
-    fn seal_one(k0: &[u8; 32], seq: u64, prev: &str) -> AgentLog {
+    pub(crate) fn seal_one(k0: &[u8; 32], seq: u64, prev: &str) -> AgentLog {
         let mut log = AgentLog {
             seq,
             epoch: 0,
@@ -1378,7 +1715,7 @@ mod concurrency_tests {
 
     /// `count` sealed records starting at `from_seq`, plus the hash the next
     /// batch must chain from.
-    fn batch(k0: &[u8; 32], from_seq: u64, count: u64, prev: &str) -> (String, String) {
+    pub(crate) fn batch(k0: &[u8; 32], from_seq: u64, count: u64, prev: &str) -> (String, String) {
         let mut body = String::new();
         let mut prev = prev.to_string();
         for seq in from_seq..from_seq + count {
@@ -1390,13 +1727,13 @@ mod concurrency_tests {
         (body, prev)
     }
 
-    fn headers_for(host: &str) -> HeaderMap {
+    pub(crate) fn headers_for(host: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert("X-EDR-Host", host.parse().expect("host is a valid header"));
         h
     }
 
-    async fn post(app: &Arc<App>, host: &str, body: String) -> StatusCode {
+    pub(crate) async fn post_batch(app: &Arc<App>, host: &str, body: String) -> StatusCode {
         ingest(State(Arc::clone(app)), headers_for(host), body)
             .await
             .into_response()
@@ -1405,7 +1742,7 @@ mod concurrency_tests {
 
     /// Every line of a host's store, parsed. Catches interleaved or partial
     /// writes: a torn line does not parse.
-    fn stored_lines(dir: &Path, host: &str) -> Vec<serde_json::Value> {
+    pub(crate) fn stored_lines(dir: &Path, host: &str) -> Vec<serde_json::Value> {
         let raw = std::fs::read_to_string(events_path(dir, host)).unwrap_or_default();
         raw.lines()
             .filter(|l| !l.trim().is_empty())
@@ -1452,7 +1789,7 @@ mod concurrency_tests {
                     for b in 0..BATCHES {
                         let (body, next) = batch(&k0, b * PER_BATCH + 1, PER_BATCH, &prev);
                         prev = next;
-                        let code = post(&app, &host, body).await;
+                        let code = post_batch(&app, &host, body).await;
                         assert_eq!(code, StatusCode::OK, "host {} batch {}", host, b);
                     }
                 }));
@@ -1513,7 +1850,7 @@ mod concurrency_tests {
                 let app = Arc::clone(&app);
                 let body = body.clone();
                 tasks.push(tokio::spawn(
-                    async move { post(&app, "dup", body).await },
+                    async move { post_batch(&app, "dup", body).await },
                 ));
             }
             for t in tasks {
@@ -1549,7 +1886,7 @@ mod concurrency_tests {
                 let app = Arc::clone(&app);
                 let (body, _) = batch(&k0, b * 30 + 1, 30, GENESIS_MAC);
                 tasks.push(tokio::spawn(
-                    async move { post(&app, "racy", body).await },
+                    async move { post_batch(&app, "racy", body).await },
                 ));
             }
             for t in tasks {
@@ -1677,7 +2014,7 @@ mod concurrency_tests {
         let parked = {
             let app = Arc::clone(&app);
             let (body, _) = batch(&k0, 1, 10, GENESIS_MAC);
-            tokio::spawn(async move { post(&app, "slow", body).await })
+            tokio::spawn(async move { post_batch(&app, "slow", body).await })
         };
         // Let it get as far as it can, which is the host lock it cannot have.
         tokio::task::yield_now().await;
@@ -1687,7 +2024,7 @@ mod concurrency_tests {
         let (body, _) = batch(&k0, 1, 10, GENESIS_MAC);
         let code = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            post(&app, "quick", body),
+            post_batch(&app, "quick", body),
         )
         .await
         .expect("host 'quick' waited on host 'slow' -- something fleet-wide is held across ingest");
@@ -1714,7 +2051,7 @@ mod concurrency_tests {
 
         for _ in 0..3 {
             assert_eq!(
-                post(&app, "never-enrolled", "\n".to_string()).await,
+                post_batch(&app, "never-enrolled", "\n".to_string()).await,
                 StatusCode::FORBIDDEN
             );
         }
@@ -1727,5 +2064,444 @@ mod concurrency_tests {
         // Enrolling clears the way once the entry ages out; until then the
         // cached refusal stands, which is the documented trade.
         assert!(app.hosts.lock().await.is_empty());
+    }
+}
+
+// ---------------------------------------------------------
+// Merkle batching tests (server.md 2.6)
+// ---------------------------------------------------------
+#[cfg(test)]
+pub(crate) mod merkle_batch_tests {
+    use super::concurrency_tests::*;
+    use super::*;
+
+    /// 64 hex chars back to 32 bytes. The collector has no hex dependency of
+    /// its own and does not need one for four lines of test code.
+    fn unhex(h: &str) -> [u8; 32] {
+        let bytes = h.as_bytes();
+        assert_eq!(bytes.len(), 64, "a leaf hash is 64 hex chars: {:?}", h);
+        let mut out = [0u8; 32];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let Some(pair) = h.get(i * 2..i * 2 + 2) else {
+                panic!("hex pair {}", i)
+            };
+            *slot = u8::from_str_radix(pair, 16).unwrap_or_else(|e| panic!("hex: {}", e));
+        }
+        out
+    }
+
+    /// Every batch line a host has sealed.
+    pub(crate) fn batch_lines(dir: &Path, host: &str) -> Vec<BatchLine> {
+        let raw = std::fs::read_to_string(batches_path(dir, host)).unwrap_or_default();
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("batch line {:?}: {}", l, e)))
+            .collect()
+    }
+
+    /// A batch commits to the bytes it actually wrote.
+    ///
+    /// This is the assertion the whole feature rests on: re-read the events
+    /// file over the batch's own byte range, recompute every leaf from those
+    /// bytes, and rebuild the chainhash. It is `merkle-audit` in miniature, and
+    /// it is what catches a leaf that was pushed out of step with its line.
+    /// Recompute a batch's leaves from the events bytes it names. Pure -- it
+    /// asserts nothing, so a tampered store yields different leaves rather
+    /// than a panic. Returns None if the range is no longer readable at all.
+    pub(crate) fn recompute_leaves(dir: &Path, host: &str, b: &BatchLine) -> Option<Vec<[u8; 32]>> {
+        let raw = std::fs::read(events_path(dir, host)).ok()?;
+        let slice = raw.get(b.byte_start as usize..b.byte_end as usize)?;
+        let text = std::str::from_utf8(slice).ok()?;
+
+        let mut leaves = Vec::new();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            let leaf = match v.get("record") {
+                Some(rec) => match serde_json::from_value::<AgentLog>(rec.clone()) {
+                    Ok(parsed) => merkle::record_leaf(&parsed)
+                        .unwrap_or_else(|| merkle::marker_leaf(line.as_bytes())),
+                    Err(_) => merkle::marker_leaf(line.as_bytes()),
+                },
+                // A marker's leaf is over the exact bytes the collector wrote.
+                None => merkle::marker_leaf(line.as_bytes()),
+            };
+            leaves.push(leaf);
+        }
+        Some(leaves)
+    }
+
+    /// Chainhash of batch `id` as the events file stands now. Differs from the
+    /// stored one exactly when the committed bytes have changed.
+    pub(crate) fn recomputed_chainhash(dir: &Path, host: &str, id: usize) -> Option<String> {
+        let batches = batch_lines(dir, host);
+        let b = batches.get(id)?;
+        Some(hex_string(&merkle::root(&recompute_leaves(dir, host, b)?)))
+    }
+
+    /// The strict form the happy-path tests use: recompute, and additionally
+    /// assert every stored leaf matches. `merkle-audit` in miniature.
+    pub(crate) fn verify_batch_against_bytes(dir: &Path, host: &str, b: &BatchLine) -> String {
+        let Some(leaves) = recompute_leaves(dir, host, b) else {
+            panic!("batch {} names a byte range that no longer reads", b.batch_id)
+        };
+        assert_eq!(leaves.len(), b.count as usize, "batch {} leaf count", b.batch_id);
+        for (i, l) in leaves.iter().enumerate() {
+            assert_eq!(
+                Some(&hex_string(l)),
+                b.leaves.get(i),
+                "batch {} leaf {} does not match the stored leaf",
+                b.batch_id,
+                i
+            );
+        }
+        hex_string(&merkle::root(&leaves))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_commits_to_the_bytes_it_wrote() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [21u8; 32];
+        enroll_for_test(&dir.0, "web-01", &k0);
+
+        let mut prev = GENESIS_MAC.to_string();
+        for b in 0..3u64 {
+            let (body, next) = batch(&k0, b * 5 + 1, 5, &prev);
+            prev = next;
+            assert_eq!(post_batch(&app, "web-01", body).await, StatusCode::OK);
+        }
+
+        let batches = batch_lines(&dir.0, "web-01");
+        assert_eq!(batches.len(), 3, "one batch line per accepted POST");
+
+        let mut expect_prev = GENESIS_MAC.to_string();
+        let mut expect_start = 0u64;
+        for (i, b) in batches.iter().enumerate() {
+            assert_eq!(b.v, 1);
+            assert_eq!(b.batch_id, i as u64, "batch_id must be dense from 0");
+            assert_eq!(b.host, "web-01");
+            assert_eq!(b.count, 5);
+            assert_eq!(b.seq_lo, i as u64 * 5 + 1);
+            assert_eq!(b.seq_hi, i as u64 * 5 + 5);
+            // Ranges are contiguous and non-overlapping.
+            assert_eq!(b.byte_start, expect_start, "batch {} byte_start", i);
+            assert!(b.byte_end > b.byte_start);
+            expect_start = b.byte_end;
+            // prev_chainhash chains, so deleting a whole batch line shows up.
+            assert_eq!(b.prev_chainhash, expect_prev, "batch {} prev_chainhash", i);
+            expect_prev = b.chainhash.clone();
+            // And the commitment matches the bytes on disk.
+            assert_eq!(
+                verify_batch_against_bytes(&dir.0, "web-01", b),
+                b.chainhash,
+                "batch {} chainhash",
+                i
+            );
+        }
+
+        let events_len = std::fs::metadata(events_path(&dir.0, "web-01"))
+            .unwrap_or_else(|e| panic!("events: {}", e))
+            .len();
+        assert_eq!(expect_start, events_len, "batches must cover the whole file");
+    }
+
+    /// An idempotent replay seals nothing.
+    ///
+    /// Every record is skipped by the `seq <= high_seq` check, so
+    /// `pending_leaves` is empty and no second batch line is written. Easy to
+    /// get wrong, and getting it wrong means a batch committing to zero bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replayed_batch_seals_nothing() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [22u8; 32];
+        enroll_for_test(&dir.0, "replay", &k0);
+
+        let (body, _) = batch(&k0, 1, 4, GENESIS_MAC);
+        assert_eq!(post_batch(&app, "replay", body.clone()).await, StatusCode::OK);
+        assert_eq!(batch_lines(&dir.0, "replay").len(), 1);
+
+        for _ in 0..3 {
+            assert_eq!(post_batch(&app, "replay", body.clone()).await, StatusCode::OK);
+        }
+        assert_eq!(
+            batch_lines(&dir.0, "replay").len(),
+            1,
+            "a replay wrote a second batch line"
+        );
+        assert_eq!(stored_lines(&dir.0, "replay").len(), 4);
+    }
+
+    /// A CHAIN_BREAK marker is a committed leaf, and provable.
+    ///
+    /// The marker is the most valuable line in the file. If it were left
+    /// uncommitted, deleting it later would be invisible.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_chain_break_marker_is_committed_and_provable() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [23u8; 32];
+        enroll_for_test(&dir.0, "broken", &k0);
+
+        let (good, _) = batch(&k0, 1, 2, GENESIS_MAC);
+        assert_eq!(post_batch(&app, "broken", good).await, StatusCode::OK);
+
+        // seq 5 with a genesis prev_hash: a gap and a broken link.
+        let (bad, _) = batch(&k0, 5, 1, GENESIS_MAC);
+        assert_eq!(post_batch(&app, "broken", bad).await, StatusCode::CONFLICT);
+
+        let batches = batch_lines(&dir.0, "broken");
+        assert_eq!(batches.len(), 2);
+        let Some(b) = batches.get(1) else { panic!("second batch") };
+        // The marker plus the record it flagged.
+        assert_eq!(b.count, 2, "the marker must be committed alongside the record");
+        assert_eq!(verify_batch_against_bytes(&dir.0, "broken", b), b.chainhash);
+
+        // The marker leaf is provable against the batch chainhash without K0.
+        let leaves: Vec<[u8; 32]> = b
+            .leaves
+            .iter()
+            .map(|h| unhex(h))
+            .collect();
+        let root = merkle::root(&leaves);
+        assert_eq!(hex_string(&root), b.chainhash);
+        for (i, leaf) in leaves.iter().enumerate() {
+            let p = merkle::path(&leaves, i).unwrap_or_else(|| panic!("path {}", i));
+            assert!(merkle::verify_path(*leaf, i, leaves.len(), &p, root));
+        }
+    }
+
+    /// A state file written before Merkle batching existed still loads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pre_merkle_state_file_loads_and_starts_at_batch_zero() {
+        let dir = temp_dir();
+        let k0 = [24u8; 32];
+        enroll_for_test(&dir.0, "old", &k0);
+
+        // Exactly the shape the collector wrote before this change.
+        let legacy = json!({
+            "high_seq": 0, "high_epoch": 0, "last_mac": GENESIS_MAC,
+            "last_seen": null, "breaks": 0, "segment": 0,
+            "total_records": 0, "silent": false
+        });
+        write_atomic(
+            &state_path(&dir.0, "old"),
+            &serde_json::to_string_pretty(&legacy).unwrap_or_else(|e| panic!("{}", e)),
+        )
+        .unwrap_or_else(|e| panic!("{}", e));
+
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let (body, _) = batch(&k0, 1, 3, GENESIS_MAC);
+        assert_eq!(post_batch(&app, "old", body).await, StatusCode::OK);
+
+        let batches = batch_lines(&dir.0, "old");
+        assert_eq!(batches.len(), 1);
+        let Some(b) = batches.first() else { panic!("batch") };
+        assert_eq!(b.batch_id, 0, "a legacy state file must start at batch 0");
+        assert_eq!(b.prev_chainhash, GENESIS_MAC);
+    }
+
+    /// Concurrent writers to one host produce disjoint, contiguous ranges and
+    /// a dense batch_id sequence -- no two batches claim the same bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_batches_claim_disjoint_byte_ranges() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 32));
+        let k0 = [25u8; 32];
+        enroll_for_test(&dir.0, "racy", &k0);
+
+        let mut tasks = Vec::new();
+        for b in 0..8u64 {
+            let app = Arc::clone(&app);
+            let (body, _) = batch(&k0, b * 10 + 1, 10, GENESIS_MAC);
+            tasks.push(tokio::spawn(async move { post_batch(&app, "racy", body).await }));
+        }
+        for t in tasks {
+            t.await.expect("no panic");
+        }
+
+        let mut batches = batch_lines(&dir.0, "racy");
+        batches.sort_by_key(|b| b.batch_id);
+        for (i, b) in batches.iter().enumerate() {
+            assert_eq!(b.batch_id, i as u64, "batch_id must be dense with no duplicates");
+            assert_eq!(
+                verify_batch_against_bytes(&dir.0, "racy", b),
+                b.chainhash,
+                "batch {} does not match its bytes",
+                i
+            );
+        }
+        // Ranges are contiguous end-to-start and therefore non-overlapping.
+        let mut cursor = 0u64;
+        for b in &batches {
+            assert_eq!(b.byte_start, cursor, "batch {} overlaps or skips", b.batch_id);
+            cursor = b.byte_end;
+        }
+    }
+
+    /// The kill switch: with batching off, ingest works and seals nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn merkle_off_stores_records_and_writes_no_batches() {
+        let dir = temp_dir();
+        let app = Arc::new(App::with_merkle(dir.0.clone(), 8, false));
+        let k0 = [26u8; 32];
+        enroll_for_test(&dir.0, "plain", &k0);
+
+        let (body, _) = batch(&k0, 1, 4, GENESIS_MAC);
+        assert_eq!(post_batch(&app, "plain", body).await, StatusCode::OK);
+        assert_eq!(stored_lines(&dir.0, "plain").len(), 4);
+        assert!(!batches_path(&dir.0, "plain").exists());
+    }
+
+    /// The in-memory index survives a restart: rebuilt by scanning the files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_index_is_rebuilt_from_disk_at_startup() {
+        let dir = temp_dir();
+        let k0 = [27u8; 32];
+        enroll_for_test(&dir.0, "restart", &k0);
+
+        {
+            let app = Arc::new(App::new(dir.0.clone(), 8));
+            let mut prev = GENESIS_MAC.to_string();
+            for b in 0..3u64 {
+                let (body, next) = batch(&k0, b * 4 + 1, 4, &prev);
+                prev = next;
+                assert_eq!(post_batch(&app, "restart", body).await, StatusCode::OK);
+            }
+        }
+
+        // Fresh process, same data dir.
+        let reborn = Arc::new(App::new(dir.0.clone(), 8));
+        let index = reborn.merkle.lock().await;
+        let Some(entries) = index.batches.get("restart") else {
+            panic!("the index did not survive the restart")
+        };
+        assert_eq!(entries.len(), 3);
+        let on_disk = batch_lines(&dir.0, "restart");
+        for (i, e) in entries.iter().enumerate() {
+            let Some(b) = on_disk.get(i) else { panic!("batch {}", i) };
+            assert_eq!(e.batch_id, b.batch_id);
+            assert_eq!(e.byte_start, b.byte_start);
+            assert_eq!(e.byte_end, b.byte_end);
+            assert_eq!(e.count, b.count);
+        }
+        // line_offsets point at real lines.
+        let raw = std::fs::read(batches_path(&dir.0, "restart")).unwrap_or_else(|e| panic!("{}", e));
+        for e in entries.iter() {
+            let Some(rest) = raw.get(e.line_offset as usize..) else {
+                panic!("line_offset {} is past the file", e.line_offset)
+            };
+            assert_eq!(rest.first(), Some(&b'{'), "line_offset is not at a line start");
+        }
+    }
+}
+
+// ---------------------------------------------------------
+// Tamper detection (server.md acceptance tests)
+// ---------------------------------------------------------
+//
+// The point of committing to bytes is that changing them afterwards is
+// detectable by anyone, without K0. These drive that directly: edit the store
+// behind the collector's back and confirm the commitment no longer matches.
+#[cfg(test)]
+mod tamper_tests {
+    use super::concurrency_tests::*;
+    use super::merkle_batch_tests::*;
+    use super::*;
+
+    async fn one_batch(dir: &Path, host: &str, k0: &[u8; 32]) {
+        let app = Arc::new(App::new(dir.to_path_buf(), 8));
+        enroll_for_test(dir, host, k0);
+        let (body, _) = batch(k0, 1, 6, GENESIS_MAC);
+        assert_eq!(post_batch(&app, host, body).await, StatusCode::OK);
+    }
+
+    /// Editing one byte of a stored record breaks its batch's chainhash.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn editing_one_byte_of_a_record_breaks_the_commitment() {
+        let dir = temp_dir();
+        let k0 = [31u8; 32];
+        one_batch(&dir.0, "victim", &k0).await;
+
+        let path = events_path(&dir.0, "victim");
+        let before = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}", e));
+        let sealed = recomputed_chainhash(&dir.0, "victim", 0);
+        assert!(sealed.is_some(), "the untampered store recomputes cleanly");
+
+        // Rename the process in one record. Everything else is untouched, and
+        // the line is still valid JSON -- only the committed bytes differ.
+        let after = before.replacen("\"process_name\":\"bash\"", "\"process_name\":\"bosh\"", 1);
+        assert_ne!(after, before, "the tamper must actually change the file");
+        assert_eq!(after.len(), before.len(), "same length, so byte ranges still line up");
+        std::fs::write(&path, &after).unwrap_or_else(|e| panic!("{}", e));
+
+        assert_ne!(
+            recomputed_chainhash(&dir.0, "victim", 0),
+            sealed,
+            "a tampered record recomputed to the same chainhash"
+        );
+    }
+
+    /// Deleting a whole line breaks it too -- the leaf count no longer matches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_a_line_breaks_the_commitment() {
+        let dir = temp_dir();
+        let k0 = [32u8; 32];
+        one_batch(&dir.0, "gap", &k0).await;
+
+        let path = events_path(&dir.0, "gap");
+        let before = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}", e));
+        let kept: Vec<&str> = before.lines().skip(1).collect();
+        std::fs::write(&path, kept.join("\n") + "\n").unwrap_or_else(|e| panic!("{}", e));
+
+        // The batch names a byte range; a deleted line means the range no
+        // longer holds the committed count.
+        let batches = batch_lines(&dir.0, "gap");
+        let Some(b) = batches.first() else { panic!("batch") };
+        let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{}", e));
+        let recomputed = raw
+            .get(b.byte_start as usize..b.byte_end as usize)
+            .map(|slice| String::from_utf8_lossy(slice).lines().count());
+        assert_ne!(
+            recomputed,
+            Some(b.count as usize),
+            "a deleted line left the committed count intact"
+        );
+    }
+
+    /// Deleting a batch line breaks prev_chainhash continuity, which is visible
+    /// without ever reaching for the on-chain root.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_a_batch_line_breaks_the_batch_chain() {
+        let dir = temp_dir();
+        let k0 = [33u8; 32];
+        enroll_for_test(&dir.0, "chained", &k0);
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let mut prev = GENESIS_MAC.to_string();
+        for b in 0..3u64 {
+            let (body, next) = batch(&k0, b * 3 + 1, 3, &prev);
+            prev = next;
+            assert_eq!(post_batch(&app, "chained", body).await, StatusCode::OK);
+        }
+
+        let path = batches_path(&dir.0, "chained");
+        let before = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}", e));
+        let kept: Vec<&str> = before
+            .lines()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, l)| l)
+            .collect();
+        std::fs::write(&path, kept.join("\n") + "\n").unwrap_or_else(|e| panic!("{}", e));
+
+        let remaining = batch_lines(&dir.0, "chained");
+        assert_eq!(remaining.len(), 2);
+        let (Some(first), Some(second)) = (remaining.first(), remaining.get(1)) else {
+            panic!("two batches")
+        };
+        assert_ne!(
+            second.prev_chainhash, first.chainhash,
+            "removing a batch line left the chain looking intact"
+        );
     }
 }
