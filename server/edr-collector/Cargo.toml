@@ -16,6 +16,11 @@ axum = "0.8"
 chrono = "0.4"
 env_logger = { workspace = true }
 
+[dev-dependencies]
+# axum already pulls tower in; this only adds ServiceExt::oneshot so the
+# concurrency tests can drive the real router, admission control included.
+tower = { version = "0.5", features = ["util"] }
+
 [[bin]]
 name = "edr-collector"
 path = "src/main.rs"

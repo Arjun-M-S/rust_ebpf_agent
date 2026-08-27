@@ -73,6 +73,13 @@ enum Command {
         /// Seconds without a batch before a host is reported silent.
         #[arg(long, default_value_t = 300)]
         silence_secs: i64,
+        /// Ingest requests admitted at once. This bounds worst-case ingest
+        /// memory at roughly max_concurrent_ingest * 16 MB (the body limit),
+        /// so the default is ~512 MB. Excess requests get 503 + Retry-After,
+        /// never a 4xx: the shipper keeps them in its WAL and retries, so
+        /// shedding here costs latency and nothing else.
+        #[arg(long, default_value_t = 32)]
+        max_concurrent_ingest: usize,
         /// Where to serve the read-only dashboard. Deliberately a SEPARATE
         /// socket from --listen: the ingest port must be reachable by the
         /// proxy, and the proxy is not trusted. Sharing one port would let it
@@ -207,11 +214,130 @@ struct Host {
     state: HostState,
 }
 
+/// LOCK ORDER -- exactly one order is legal, and every handler must obey it:
+///
+///     app.hosts (registry)  ->  Host (per-host)  ->  [future: merkle index]
+///
+/// Violating it deadlocks the collector, and `panic = "abort"` means a
+/// deadlocked collector blinds the whole fleet. The rules that keep the graph
+/// acyclic:
+///
+///   * The registry guard is held only long enough to clone an `Arc`. Never
+///     across file I/O, never across a network call, never across `.await` on
+///     another lock. A miss drops the guard, loads from disk, then re-acquires.
+///   * `ingest`: registry (brief) -> host. The host guard IS held across the
+///     append `.await`, which is why these are tokio mutexes and not std ones.
+///   * readers (`status`, dashboard): clone names + Arcs under the registry
+///     guard, drop it, then take each host lock one at a time.
+///   * `watch_for_silence`: same -- one host at a time, releasing between.
 struct App {
     data_dir: PathBuf,
-    // ponytail: one lock over all hosts. Fine for tens of hosts at a batch
-    // every few seconds; split per-host if a fleet ever makes it contend.
-    hosts: Mutex<HashMap<String, Host>>,
+    /// Registry only. Per-host state lives behind its own lock so two hosts
+    /// never wait on each other: everything the inner lock protects (high_seq,
+    /// last_mac, segment, the append offset into that host's own files) is
+    /// per-host, and two POSTs for the same host must serialise or they
+    /// interleave bytes in events/{host}.ndjson.
+    hosts: Mutex<HashMap<String, Arc<Mutex<Host>>>>,
+    /// Host ids seen recently that are not enrolled. Every unknown id
+    /// otherwise costs a filesystem miss, which turns the ingest port into
+    /// disk load for anyone who can reach it and holds no credential.
+    ///
+    /// ponytail: TTL rather than an explicit invalidation, because `enroll`
+    /// runs in a different process and cannot poke this one. A host enrolled
+    /// while the collector is running starts working within
+    /// UNENROLLED_TTL_SECS; restart if that wait is unacceptable.
+    unenrolled: Mutex<HashMap<String, std::time::Instant>>,
+    /// Admission control. With N requests in flight the collector buffers N
+    /// bodies of up to MAX_BODY_BYTES each; unbounded, that is an OOM, and a
+    /// `panic = "abort"` build turns an OOM into a fleet-wide blackout.
+    ingest_permits: Arc<tokio::sync::Semaphore>,
+}
+
+/// How long a "not enrolled" answer stays cached. One minute: long enough that
+/// a spray of unknown ids costs one stat each rather than one per request,
+/// short enough that a genuine enrollment is picked up without a restart.
+const UNENROLLED_TTL_SECS: u64 = 60;
+
+/// Bound on the negative cache. Reached only under a spray of distinct ids, so
+/// the crude fix -- drop everything and start over -- is the right one: it is
+/// O(1), it cannot grow without bound, and the cost of a cleared cache is one
+/// extra stat per real host.
+const UNENROLLED_MAX: usize = 4096;
+
+impl App {
+    /// Find or lazily load a host, returning its own lock.
+    ///
+    /// The registry guard is dropped before the enrollment is read from disk,
+    /// so a slow or missing file never blocks another host's ingest. Two
+    /// concurrent first-contacts for the same host can therefore both load it;
+    /// the first to re-acquire wins and the loser drops its copy. Both read the
+    /// same bytes, so that is harmless.
+    async fn host_entry(&self, host: &str) -> Result<Arc<Mutex<Host>>, (StatusCode, String)> {
+        if let Some(existing) = self.hosts.lock().await.get(host) {
+            return Ok(Arc::clone(existing));
+        }
+
+        {
+            let mut miss = self.unenrolled.lock().await;
+            match miss.get(host) {
+                Some(seen) if seen.elapsed().as_secs() < UNENROLLED_TTL_SECS => {
+                    return Err((StatusCode::FORBIDDEN, "host is not enrolled".to_string()));
+                }
+                Some(_) => {
+                    miss.remove(host);
+                }
+                None => {}
+            }
+        }
+
+        let Some(enrollment) = load_enrollment(&self.data_dir, host) else {
+            eprintln!("WARNING: rejected batch from unenrolled host {:?}", host);
+            let mut miss = self.unenrolled.lock().await;
+            if miss.len() >= UNENROLLED_MAX {
+                miss.clear();
+            }
+            miss.insert(host.to_string(), std::time::Instant::now());
+            return Err((StatusCode::FORBIDDEN, "host is not enrolled".to_string()));
+        };
+        let Ok(k0) = parse_key(&enrollment.k0) else {
+            eprintln!("CRITICAL: enrollment for {} has an unusable K0", host);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "enrollment is corrupt".to_string(),
+            ));
+        };
+        let state = load_state(&self.data_dir, host);
+        let loaded = Arc::new(Mutex::new(Host {
+            enrollment,
+            keys: HostKeys::new(k0),
+            state,
+        }));
+
+        let mut reg = self.hosts.lock().await;
+        Ok(Arc::clone(
+            reg.entry(host.to_string()).or_insert(loaded),
+        ))
+    }
+
+    fn new(data_dir: PathBuf, max_concurrent_ingest: usize) -> Self {
+        App {
+            data_dir,
+            hosts: Mutex::new(HashMap::new()),
+            unenrolled: Mutex::new(HashMap::new()),
+            ingest_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_ingest)),
+        }
+    }
+
+    /// Every host and its lock, as a snapshot. The registry guard is released
+    /// before the caller touches any of them.
+    async fn host_snapshot(&self) -> Vec<(String, Arc<Mutex<Host>>)> {
+        self.hosts
+            .lock()
+            .await
+            .iter()
+            .map(|(name, h)| (name.clone(), Arc::clone(h)))
+            .collect()
+    }
 }
 
 fn enroll_path(dir: &Path, host: &str) -> PathBuf {
@@ -367,47 +493,24 @@ async fn ingest(
         }
     };
 
-    let mut hosts = app.hosts.lock().await;
-
     // Load on first contact. An unenrolled host is refused: without K0 there is
     // nothing to verify against, and storing unverifiable records under a name
     // an attacker chose would be worse than refusing them.
-    if !hosts.contains_key(&host) {
-        let Some(enrollment) = load_enrollment(&app.data_dir, &host) else {
-            eprintln!("WARNING: rejected batch from unenrolled host {:?}", host);
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({"acked_seq": 0, "error": "host is not enrolled"})),
-            );
-        };
-        let Ok(k0) = parse_key(&enrollment.k0) else {
-            eprintln!("CRITICAL: enrollment for {} has an unusable K0", host);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"acked_seq": 0, "error": "enrollment is corrupt"})),
-            );
-        };
-        let state = load_state(&app.data_dir, &host);
-        hosts.insert(
-            host.clone(),
-            Host {
-                enrollment,
-                keys: HostKeys::new(k0),
-                state,
-            },
-        );
-    }
-
-    let Some(entry) = hosts.get_mut(&host) else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"acked_seq": 0, "error": "host vanished from registry"})),
-        );
+    //
+    // The registry lock is taken and released inside here; from this point on
+    // the only lock held is this one host's, so every other host ingests in
+    // parallel with this request.
+    let host_entry = match app.host_entry(&host).await {
+        Ok(h) => h,
+        Err((code, err)) => return (code, Json(json!({"acked_seq": 0, "error": err}))),
     };
+    let mut guard = host_entry.lock().await;
+    // One deref_mut, then field-split. Lets `&state` and `&mut keys` be taken
+    // at once in the loop below, which a bare guard would not allow.
+    let entry = &mut *guard;
 
     let now: DateTime<Utc> = Utc::now();
     let mut out = String::with_capacity(body.len() + 256);
-    let mut accepted = 0u64;
     let mut first_error: Option<String> = None;
 
     // SUP-2: the agent reports the identity of the binary that is running. A
@@ -525,12 +628,22 @@ async fn ingest(
         entry.state.high_epoch = entry.state.high_epoch.max(rec.epoch);
         entry.state.last_mac = rec.hash.clone();
         entry.state.total_records += 1;
-        accepted += 1;
     }
 
     if !out.is_empty() {
         let path = events_path(&app.data_dir, &host);
-        let append = || -> std::io::Result<()> {
+        let bytes = std::mem::take(&mut out);
+
+        // sync_all() is a blocking syscall. Run inline, it parks a tokio worker
+        // thread in fsync, and under a fleet's worth of concurrent agents the
+        // runtime stops making progress on anything else -- including
+        // /healthz, which makes a busy collector look dead to whatever is
+        // watching it. The blocking pool exists for exactly this.
+        //
+        // This host's guard IS held across the await, deliberately: two POSTs
+        // for one host must not interleave their bytes. Other hosts are
+        // unaffected, which is the whole point of the per-host lock.
+        let append = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -538,10 +651,21 @@ async fn ingest(
                 .create(true)
                 .append(true)
                 .open(&path)?;
-            f.write_all(out.as_bytes())?;
+            f.write_all(bytes.as_bytes())?;
             f.sync_all()
+        })
+        .await;
+
+        // A JoinError means the blocking task panicked or was cancelled. Treat
+        // it exactly like a write failure: nothing is known to be on disk, so
+        // nothing may be acked. Never unwrap the join (PANIC POLICY).
+        let failure = match append {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(join) => Some(format!("append task did not complete: {}", join)),
         };
-        if let Err(e) = append() {
+
+        if let Some(e) = failure {
             // Do NOT ack what was not stored. The agent keeps it in the WAL and
             // retries; acking here would delete the only remaining copy.
             // seq is not dense -- a gap means high_seq - accepted is not the
@@ -565,9 +689,16 @@ async fn ingest(
 
     let acked = entry.state.high_seq;
     let state_copy = entry.state.clone();
-    drop(hosts);
+    drop(guard);
 
-    save_state(&app.data_dir, &host, &state_copy);
+    // Off the runtime threads for the same reason as the append: write_atomic
+    // ends in its own sync_all().
+    let dir = app.data_dir.clone();
+    let host_for_save = host.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        save_state(&dir, &host_for_save, &state_copy);
+    })
+    .await;
 
     match first_error {
         Some(err) => (
@@ -579,27 +710,80 @@ async fn ingest(
 }
 
 async fn status(State(app): State<Arc<App>>) -> impl IntoResponse {
-    let hosts = app.hosts.lock().await;
-    let summary: Vec<_> = hosts
-        .iter()
-        .map(|(name, h)| {
-            json!({
-                "host": name,
-                "high_seq": h.state.high_seq,
-                "epoch": h.state.high_epoch,
-                "records": h.state.total_records,
-                "breaks": h.state.breaks,
-                "segment": h.state.segment,
-                "last_seen": h.state.last_seen,
-                "silent": h.state.silent,
-            })
-        })
-        .collect();
+    // Registry guard released before any host lock is taken (see LOCK ORDER).
+    // ponytail: a host mid-fsync makes this wait on that one host, not on the
+    // fleet. Give HostState an atomic snapshot if that ever shows up in a
+    // latency graph.
+    let mut summary = Vec::new();
+    for (name, entry) in app.host_snapshot().await {
+        let h = entry.lock().await;
+        summary.push(json!({
+            "host": name,
+            "high_seq": h.state.high_seq,
+            "epoch": h.state.high_epoch,
+            "records": h.state.total_records,
+            "breaks": h.state.breaks,
+            "segment": h.state.segment,
+            "last_seen": h.state.last_seen,
+            "silent": h.state.silent,
+        }));
+    }
     Json(json!({"hosts": summary}))
 }
 
 async fn health() -> &'static str {
     "ok\n"
+}
+
+/// Admission control for the ingest route only.
+///
+/// Runs before the handler, and therefore before the body extractor buffers up
+/// to MAX_BODY_BYTES into a String -- which is the whole point: the memory this
+/// bounds is allocated by the extractor, so gating after it would bound
+/// nothing.
+///
+/// Sheds with 503, never 409. The shipper advances its cursor past a 409 on the
+/// grounds that the evidence is already off-box; returning one under load would
+/// drop records on the floor for the one reason that has nothing to do with
+/// tampering. A 503 leaves them in the WAL for the next poll.
+async fn admit_ingest(
+    State(app): State<Arc<App>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Ok(_permit) = Arc::clone(&app.ingest_permits).try_acquire_owned() else {
+        eprintln!("WARNING: shedding an ingest batch: at capacity");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "5")],
+            Json(json!({"acked_seq": 0, "error": "collector at capacity, retry"})),
+        )
+            .into_response();
+    };
+    next.run(req).await
+}
+
+/// The agent-facing socket. Built here rather than inline in `serve` so the
+/// concurrency tests drive the same router the fleet does, admission control
+/// included.
+///
+/// The semaphore layer wraps ONLY /v1/ingest. /healthz and /v1/status must keep
+/// answering while ingest is saturated -- a collector that fails its own health
+/// check under normal fleet load reads as dead and gets restarted, which is
+/// strictly worse than being slow.
+fn ingest_router(app: Arc<App>) -> Router {
+    Router::new()
+        .route(
+            "/v1/ingest",
+            post(ingest).layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&app),
+                admit_ingest,
+            )),
+        )
+        .route("/v1/status", get(status))
+        .route("/healthz", get(health))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .with_state(app)
 }
 
 // ---------------------------------------------------------
@@ -621,23 +805,24 @@ async fn watch_for_silence(app: Arc<App>, silence_secs: i64) {
         let now = Utc::now();
         let mut newly_silent = Vec::new();
 
-        {
-            let mut hosts = app.hosts.lock().await;
-            for (name, h) in hosts.iter_mut() {
-                if h.state.silent {
-                    continue;
-                }
-                let Some(seen) = h.state.last_seen.as_deref() else {
-                    continue;
-                };
-                let Ok(seen) = DateTime::parse_from_rfc3339(seen) else {
-                    continue;
-                };
-                let quiet_for = now.signed_duration_since(seen.with_timezone(&Utc));
-                if quiet_for.num_seconds() > silence_secs {
-                    h.state.silent = true;
-                    newly_silent.push((name.clone(), quiet_for.num_seconds(), h.state.clone()));
-                }
+        // One host lock at a time, registry guard already released. Holding
+        // the registry across the whole sweep would park every ingest on this
+        // background task once a minute.
+        for (name, entry) in app.host_snapshot().await {
+            let mut h = entry.lock().await;
+            if h.state.silent {
+                continue;
+            }
+            let Some(seen) = h.state.last_seen.as_deref() else {
+                continue;
+            };
+            let Ok(seen) = DateTime::parse_from_rfc3339(seen) else {
+                continue;
+            };
+            let quiet_for = now.signed_duration_since(seen.with_timezone(&Utc));
+            if quiet_for.num_seconds() > silence_secs {
+                h.state.silent = true;
+                newly_silent.push((name.clone(), quiet_for.num_seconds(), h.state.clone()));
             }
         }
 
@@ -869,15 +1054,15 @@ async fn main() -> Result<(), anyhow::Error> {
         Command::Serve {
             listen,
             silence_secs,
+            max_concurrent_ingest,
             dashboard_listen,
         } => {
             std::fs::create_dir_all(cli.data_dir.join("hosts"))?;
             std::fs::create_dir_all(cli.data_dir.join("events"))?;
 
-            let app = Arc::new(App {
-                data_dir: cli.data_dir.clone(),
-                hosts: Mutex::new(HashMap::new()),
-            });
+            // A zero here would wedge ingest permanently, so it is floored.
+            let permits = max_concurrent_ingest.max(1);
+            let app = Arc::new(App::new(cli.data_dir.clone(), permits));
 
             // Warm the registry so `status` and silence detection see hosts
             // that have not reported since this process started.
@@ -897,11 +1082,11 @@ async fn main() -> Result<(), anyhow::Error> {
                     let state = load_state(&cli.data_dir, host);
                     app.hosts.lock().await.insert(
                         host.to_string(),
-                        Host {
+                        Arc::new(Mutex::new(Host {
                             enrollment,
                             keys: HostKeys::new(k0),
                             state,
-                        },
+                        })),
                     );
                 }
             }
@@ -934,17 +1119,13 @@ async fn main() -> Result<(), anyhow::Error> {
                 });
             }
 
-            let router = Router::new()
-                .route("/v1/ingest", post(ingest))
-                .route("/v1/status", get(status))
-                .route("/healthz", get(health))
-                .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-                .with_state(Arc::clone(&app));
+            let router = ingest_router(Arc::clone(&app));
 
             let listener = tokio::net::TcpListener::bind(&listen).await?;
             eprintln!(
-                "edr-collector listening on {} | {} host(s) enrolled | data {:?}",
-                listen, enrolled, cli.data_dir
+                "edr-collector listening on {} | {} host(s) enrolled | data {:?} | \
+                 {} concurrent ingest",
+                listen, enrolled, cli.data_dir, permits
             );
             eprintln!(
                 "NOTE: plain HTTP. Terminate TLS in front of this and bind it to localhost."
@@ -1122,5 +1303,429 @@ mod tests {
         assert!(!valid_host_id(".hidden"));
         assert!(!valid_host_id(""));
         assert!(!valid_host_id("a..b"));
+    }
+}
+
+// ---------------------------------------------------------
+// Concurrency tests (server.md 2.11.6)
+// ---------------------------------------------------------
+//
+// The design target is hundreds of hosts each POSTing up to 500 records every
+// few seconds. What these pin down is that different hosts never wait on each
+// other, that the same host always does, and that an overloaded collector sheds
+// with a status the shipper treats as retryable.
+//
+// Every test runs under a wall-clock timeout. A lock inversion should fail CI
+// in seconds rather than hang it until the job is killed.
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use edr_record::record_mac;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tower::ServiceExt;
+
+    const DEADLOCK_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// A data dir that removes itself. No tempfile dependency for four lines.
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir() -> TempDir {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "edr-collector-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::create_dir_all(dir.join("hosts"));
+        let _ = std::fs::create_dir_all(dir.join("events"));
+        TempDir(dir)
+    }
+
+    fn enroll_for_test(dir: &Path, host: &str, k0: &[u8; 32]) {
+        let enrollment = Enrollment {
+            k0: hex_of(k0),
+            build_id: None,
+            enrolled_at: Utc::now().to_rfc3339(),
+        };
+        let json = serde_json::to_string(&enrollment).expect("enrollment serialises");
+        write_atomic(&enroll_path(dir, host), &json).expect("enrollment written");
+    }
+
+    fn hex_of(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    fn seal_one(k0: &[u8; 32], seq: u64, prev: &str) -> AgentLog {
+        let mut log = AgentLog {
+            seq,
+            epoch: 0,
+            timestamp: "2026-08-27T10:00:00+00:00".to_string(),
+            severity: "INFO".to_string(),
+            event_type: "PROCESS_EXEC".to_string(),
+            process_name: "bash".to_string(),
+            prev_hash: prev.to_string(),
+            ..Default::default()
+        };
+        log.hash = record_mac(k0, &log);
+        log
+    }
+
+    /// `count` sealed records starting at `from_seq`, plus the hash the next
+    /// batch must chain from.
+    fn batch(k0: &[u8; 32], from_seq: u64, count: u64, prev: &str) -> (String, String) {
+        let mut body = String::new();
+        let mut prev = prev.to_string();
+        for seq in from_seq..from_seq + count {
+            let rec = seal_one(k0, seq, &prev);
+            prev = rec.hash.clone();
+            body.push_str(&serde_json::to_string(&rec).expect("record serialises"));
+            body.push('\n');
+        }
+        (body, prev)
+    }
+
+    fn headers_for(host: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("X-EDR-Host", host.parse().expect("host is a valid header"));
+        h
+    }
+
+    async fn post(app: &Arc<App>, host: &str, body: String) -> StatusCode {
+        ingest(State(Arc::clone(app)), headers_for(host), body)
+            .await
+            .into_response()
+            .status()
+    }
+
+    /// Every line of a host's store, parsed. Catches interleaved or partial
+    /// writes: a torn line does not parse.
+    fn stored_lines(dir: &Path, host: &str) -> Vec<serde_json::Value> {
+        let raw = std::fs::read_to_string(events_path(dir, host)).unwrap_or_default();
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                serde_json::from_str(l)
+                    .unwrap_or_else(|e| panic!("torn or interleaved line {:?}: {}", l, e))
+            })
+            .collect()
+    }
+
+    /// 50 hosts ingesting at once, 10 sequential batches each.
+    ///
+    /// Different hosts share nothing, so every batch must commit cleanly. If
+    /// the registry lock were still held across the append this would pass but
+    /// take 500 fsyncs of wall clock; what it actually proves is that no host's
+    /// bytes land in another host's file and no line is torn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fifty_hosts_ingest_in_parallel() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 64));
+
+        const HOSTS: u64 = 50;
+        const BATCHES: u64 = 10;
+        const PER_BATCH: u64 = 20;
+
+        let mut keys = Vec::new();
+        for i in 0..HOSTS {
+            let host = format!("host-{:02}", i);
+            let mut k0 = [0u8; 32];
+            k0[0] = i as u8;
+            k0[1] = 7;
+            enroll_for_test(&dir.0, &host, &k0);
+            keys.push((host, k0));
+        }
+
+        let run = async {
+            let mut tasks = Vec::new();
+            for (host, k0) in keys.clone() {
+                let app = Arc::clone(&app);
+                tasks.push(tokio::spawn(async move {
+                    // Sequential within a host: seq must not skip, or the
+                    // collector correctly reports a gap.
+                    let mut prev = GENESIS_MAC.to_string();
+                    for b in 0..BATCHES {
+                        let (body, next) = batch(&k0, b * PER_BATCH + 1, PER_BATCH, &prev);
+                        prev = next;
+                        let code = post(&app, &host, body).await;
+                        assert_eq!(code, StatusCode::OK, "host {} batch {}", host, b);
+                    }
+                }));
+            }
+            for t in tasks {
+                t.await.expect("ingest task did not panic");
+            }
+        };
+        tokio::time::timeout(DEADLOCK_GUARD, run)
+            .await
+            .expect("deadlock guard: parallel ingest did not finish");
+
+        for (host, _) in &keys {
+            let lines = stored_lines(&dir.0, host);
+            assert_eq!(
+                lines.len() as u64,
+                BATCHES * PER_BATCH,
+                "host {} stored the wrong number of lines",
+                host
+            );
+            for (i, line) in lines.iter().enumerate() {
+                let rec = line.get("record").expect("a stored record, not a marker");
+                assert_eq!(
+                    rec.get("seq").and_then(|v| v.as_u64()),
+                    Some(i as u64 + 1),
+                    "host {} line {} is out of order",
+                    host,
+                    i
+                );
+                assert_eq!(
+                    line.get("verified").and_then(|v| v.as_bool()),
+                    Some(true),
+                    "host {} line {} did not verify",
+                    host,
+                    i
+                );
+            }
+        }
+    }
+
+    /// Eight identical batches for one host, at once.
+    ///
+    /// Exactly one may be stored; the other seven must fall through the
+    /// `seq <= high_seq` replay check and store nothing. This is what a shipper
+    /// retrying after a client-side timeout actually does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_host_identical_batches_store_once() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 64));
+        let k0 = [9u8; 32];
+        enroll_for_test(&dir.0, "dup", &k0);
+
+        let (body, _) = batch(&k0, 1, 25, GENESIS_MAC);
+
+        let run = async {
+            let mut tasks = Vec::new();
+            for _ in 0..8 {
+                let app = Arc::clone(&app);
+                let body = body.clone();
+                tasks.push(tokio::spawn(
+                    async move { post(&app, "dup", body).await },
+                ));
+            }
+            for t in tasks {
+                let code = t.await.expect("ingest task did not panic");
+                assert_eq!(code, StatusCode::OK, "a replay must not be an error");
+            }
+        };
+        tokio::time::timeout(DEADLOCK_GUARD, run)
+            .await
+            .expect("deadlock guard: same-host replay did not finish");
+
+        let lines = stored_lines(&dir.0, "dup");
+        assert_eq!(lines.len(), 25, "a replayed batch was stored more than once");
+    }
+
+    /// Eight *different* batches for one host, at once.
+    ///
+    /// They arrive in an arbitrary order, so most will not chain -- that is
+    /// detection working, and the collector stores the record anyway with a
+    /// CHAIN_BREAK marker in front of it. What must hold regardless is that the
+    /// file is never corrupt: every line parses, so no two writers interleaved
+    /// their bytes, and no batch was torn in half.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_host_concurrent_writers_never_interleave() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 64));
+        let k0 = [11u8; 32];
+        enroll_for_test(&dir.0, "racy", &k0);
+
+        let run = async {
+            let mut tasks = Vec::new();
+            for b in 0..8u64 {
+                let app = Arc::clone(&app);
+                let (body, _) = batch(&k0, b * 30 + 1, 30, GENESIS_MAC);
+                tasks.push(tokio::spawn(
+                    async move { post(&app, "racy", body).await },
+                ));
+            }
+            for t in tasks {
+                let code = t.await.expect("ingest task did not panic");
+                assert!(
+                    code == StatusCode::OK || code == StatusCode::CONFLICT,
+                    "out-of-order batches are detection, not failure: got {}",
+                    code
+                );
+            }
+        };
+        tokio::time::timeout(DEADLOCK_GUARD, run)
+            .await
+            .expect("deadlock guard: concurrent same-host writers did not finish");
+
+        // The assertion that matters: stored_lines panics on any line that does
+        // not parse, which is what a torn or interleaved write looks like.
+        let lines = stored_lines(&dir.0, "racy");
+        assert!(!lines.is_empty(), "nothing was stored at all");
+        for line in &lines {
+            assert!(
+                line.get("record").is_some() || line.get("collector_event").is_some(),
+                "a line is neither a record nor a marker: {}",
+                line
+            );
+        }
+    }
+
+    /// Overload sheds with 503 and a Retry-After, never 409.
+    ///
+    /// 409 is the one wrong answer: the shipper advances its cursor past a 409
+    /// on the grounds that the evidence is already off-box, so returning one
+    /// here would drop records for a reason that has nothing to do with
+    /// tampering. Deterministic -- every permit is held for the duration rather
+    /// than raced for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overload_sheds_with_503_and_retries_succeed() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 2));
+        let k0 = [13u8; 32];
+        enroll_for_test(&dir.0, "busy", &k0);
+
+        let (body, _) = batch(&k0, 1, 10, GENESIS_MAC);
+        let request = |body: String| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/ingest")
+                .header("X-EDR-Host", "busy")
+                .body(axum::body::Body::from(body))
+                .expect("request builds")
+        };
+
+        let held: Vec<_> = (0..2)
+            .map(|_| {
+                Arc::clone(&app.ingest_permits)
+                    .try_acquire_owned()
+                    .expect("permit is free")
+            })
+            .collect();
+
+        let shed = ingest_router(Arc::clone(&app))
+            .oneshot(request(body.clone()))
+            .await
+            .expect("router responds");
+        assert_eq!(shed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            shed.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&axum::http::HeaderValue::from_static("5")),
+            "a shed batch must tell the shipper when to come back"
+        );
+
+        // Liveness: /healthz must answer while ingest is saturated. A collector
+        // that fails its own health check under load gets restarted, which is
+        // worse than being slow.
+        let health = ingest_router(Arc::clone(&app))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(
+            health.status(),
+            StatusCode::OK,
+            "healthz stalled behind saturated ingest"
+        );
+
+        drop(held);
+
+        // The retry of a shed batch commits, because nothing was acked.
+        let retried = ingest_router(Arc::clone(&app))
+            .oneshot(request(body))
+            .await
+            .expect("router responds");
+        assert_eq!(retried.status(), StatusCode::OK);
+        assert_eq!(stored_lines(&dir.0, "busy").len(), 10);
+    }
+
+    /// The refactor's whole point, pinned: a host parked mid-ingest must not
+    /// stop another host from ingesting.
+    ///
+    /// Host A's lock is taken by the test and held, then a real `ingest` for A
+    /// is spawned -- it parks on that lock with its handler half-executed,
+    /// standing in for A sitting in fsync. Host B then posts and must finish.
+    ///
+    /// This is the test that fails if anyone reintroduces a fleet-wide lock on
+    /// the ingest path, which is the specific hazard the Merkle index lock
+    /// creates in the next step: A's parked handler would be holding it, and B
+    /// would wait behind a host it shares nothing with. Verified to fail
+    /// against exactly that mutation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_host_parked_mid_ingest_does_not_block_another() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 64));
+        let k0 = [17u8; 32];
+        enroll_for_test(&dir.0, "slow", &k0);
+        enroll_for_test(&dir.0, "quick", &k0);
+
+        // Take host "slow"'s lock and keep it, so its handler cannot proceed.
+        let slow = app.host_entry("slow").await.expect("slow is enrolled");
+        let held = slow.lock().await;
+
+        let parked = {
+            let app = Arc::clone(&app);
+            let (body, _) = batch(&k0, 1, 10, GENESIS_MAC);
+            tokio::spawn(async move { post(&app, "slow", body).await })
+        };
+        // Let it get as far as it can, which is the host lock it cannot have.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!parked.is_finished(), "the parked ingest was supposed to block");
+
+        let (body, _) = batch(&k0, 1, 10, GENESIS_MAC);
+        let code = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            post(&app, "quick", body),
+        )
+        .await
+        .expect("host 'quick' waited on host 'slow' -- something fleet-wide is held across ingest");
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(stored_lines(&dir.0, "quick").len(), 10);
+
+        // Release, and the parked handler completes normally.
+        drop(held);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), parked)
+                .await
+                .expect("parked ingest never resumed")
+                .expect("parked ingest did not panic"),
+            StatusCode::OK
+        );
+    }
+
+    /// An unknown host id is refused from memory the second time, without
+    /// touching the filesystem again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unenrolled_hosts_are_refused_from_the_negative_cache() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+
+        for _ in 0..3 {
+            assert_eq!(
+                post(&app, "never-enrolled", "\n".to_string()).await,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            app.unenrolled.lock().await.len(),
+            1,
+            "the miss should be cached once, not once per request"
+        );
+
+        // Enrolling clears the way once the entry ages out; until then the
+        // cached refusal stands, which is the documented trade.
+        assert!(app.hosts.lock().await.is_empty());
     }
 }

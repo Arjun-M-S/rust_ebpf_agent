@@ -218,6 +218,9 @@ struct AlertQuery {
 async fn alerts(State(app): State<Arc<App>>, Query(q): Query<AlertQuery>) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
 
+    // Names only, under the registry guard, released immediately. The alert
+    // data itself comes from tailing the events files, which needs no host
+    // lock at all -- so a read here never sits behind an ingest fsync.
     let wanted: Vec<String> = {
         let hosts = app.hosts.lock().await;
         match q.host.as_deref() {
@@ -287,14 +290,16 @@ async fn alerts(State(app): State<Arc<App>>, Query(q): Query<AlertQuery>) -> imp
 // ---------------------------------------------------------
 
 async fn overview(State(app): State<Arc<App>>) -> impl IntoResponse {
-    let hosts = app.hosts.lock().await;
+    // Registry guard released before any host lock (see LOCK ORDER on `App`).
+    let hosts = app.host_snapshot().await;
 
     let mut list: Vec<Value> = Vec::with_capacity(hosts.len());
     let mut total_records = 0u64;
     let mut total_breaks = 0u64;
     let mut silent = 0u64;
 
-    for (name, h) in hosts.iter() {
+    for (name, entry) in hosts.iter() {
+        let h = entry.lock().await;
         total_records += h.state.total_records;
         total_breaks += h.state.breaks;
         if h.state.silent {
@@ -344,13 +349,13 @@ async fn host_detail(
     State(app): State<Arc<App>>,
     UrlPath(host): UrlPath<String>,
 ) -> impl IntoResponse {
-    let hosts = app.hosts.lock().await;
-    let Some(h) = hosts.get(&host) else {
+    let Some(entry) = app.hosts.lock().await.get(&host).map(Arc::clone) else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "no such enrolled host"})),
         );
     };
+    let h = entry.lock().await;
     (
         StatusCode::OK,
         Json(json!({
