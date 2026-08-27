@@ -9,6 +9,8 @@
 //! can locate. verify.py is the one copy that cannot be shared; its `SEALED_FIELDS`
 //! list must be kept in step with `sealed_payload` below by hand.
 
+pub mod merkle;
+
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
