@@ -4,7 +4,7 @@
 #     cd server && cargo build --release && cargo test
 [workspace]
 resolver = "2"
-members = ["edr-collector"]
+members = ["edr-collector", "edr-anchor"]
 
 [workspace.package]
 version = "0.1.0"

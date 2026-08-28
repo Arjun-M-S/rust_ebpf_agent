@@ -1,0 +1,34 @@
+# The anchor worker. The ONLY thing in this repository that holds a private key
+# or talks to a chain RPC, and it is a separate binary for exactly that reason:
+# the ingest-facing collector must not hold a funded key, and it must not depend
+# on a chain being reachable. If the chain is unreachable for a week, ingest is
+# unaffected and the backlog anchors later.
+#
+# It reads roots.ndjson and appends to anchors.ndjson. It never reads hosts/,
+# and it does not depend on edr-record -- so there is no code path in this
+# binary that can reach K0 even by accident. Run it as its own unix user.
+[package]
+name = "edr-anchor"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# rustls, never the system OpenSSL -- matching the TLS choice the agent's
+# reqwest already makes. default-features = false keeps `contract` and the ABI
+# machinery out: this worker sends calldata, it does not call a contract.
+alloy = { version = "2", default-features = false, features = [
+    "std", "consensus", "network", "rpc-types", "providers", "provider-http",
+    "signer-local", "reqwest", "reqwest-rustls-tls",
+] }
+
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }
+clap = { workspace = true, features = ["derive", "help", "usage", "error-context"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+
+[[bin]]
+name = "edr-anchor"
+path = "src/main.rs"
