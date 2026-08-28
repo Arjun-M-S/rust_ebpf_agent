@@ -59,7 +59,11 @@ pub fn routes(app: Arc<App>) -> Router {
         .route("/api/overview", get(overview))
         .route("/api/alerts", get(alerts))
         .route("/api/host/{host}", get(host_detail))
-        .with_state(app)
+        .with_state(Arc::clone(&app))
+        // Retrieval and proofs. On THIS socket and never the ingest one: these
+        // enumerate records and hand out record content, and the ingest port is
+        // reachable by a proxy the threat model already treats as hostile.
+        .merge(crate::proof::routes(app))
 }
 
 async fn page() -> impl IntoResponse {

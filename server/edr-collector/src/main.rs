@@ -27,6 +27,7 @@
 //! length, which is infallible for every key length.
 
 mod dashboard;
+mod proof;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -139,6 +140,40 @@ enum Command {
         /// Audit one host instead of every host that has batches.
         #[arg(long)]
         host: Option<String>,
+    },
+    /// Summarise the commitment layer: batches, roots, and how far behind the
+    /// anchor worker is.
+    MerkleStatus,
+    /// Emit the proof bundle for one record.
+    ///
+    /// The bundle is verifiable by someone with no access to this collector and
+    /// no K0 -- that is the point of it. Check one with `merkle-verify`, or
+    /// independently with `verify.py --proof`.
+    MerkleProof {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        seq: u64,
+        /// Disambiguate when the same seq exists in more than one segment.
+        #[arg(long)]
+        segment: Option<u64>,
+        /// Write to a file instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Check a proof bundle offline: no K0, no network, no collector.
+    ///
+    /// Chain verification is deliberately NOT here. Confirming that a root is
+    /// in a transaction needs an RPC client, and this binary is the one that
+    /// holds K0 -- it does not get a network stack for a convenience. Use
+    /// `verify.py --proof <file> --rpc-url <url>`, which is stdlib-only and is
+    /// the independent implementation anyway.
+    MerkleVerify {
+        #[arg(long)]
+        proof: PathBuf,
+        /// Also require the bundle's root to equal this hex value.
+        #[arg(long)]
+        expect_root: Option<String>,
     },
 }
 
@@ -1871,6 +1906,175 @@ fn cmd_merkle_audit(dir: &Path, host: Option<&str>) -> Result<(), anyhow::Error>
 }
 
 // ---------------------------------------------------------
+// Retrieval on the CLI (server.md 2.9, step 8)
+// ---------------------------------------------------------
+//
+// Every API capability is mirrored here. An incident responder on a box with
+// no browser needs the same answers the dashboard gives, and these run against
+// the data directory with no server process at all.
+
+fn cmd_merkle_status(dir: &Path) -> Result<(), anyhow::Error> {
+    let index = MerkleIndex::load(dir);
+    let anchors = proof::load_anchors(dir);
+
+    let mut hosts: Vec<(&String, &Vec<BatchIndexEntry>)> = index.batches.iter().collect();
+    hosts.sort_by(|a, b| a.0.cmp(b.0));
+
+    println!("{:<24} {:>8} {:>10} {:>12}", "HOST", "BATCHES", "LINES", "LAST SEALED");
+    let mut total_batches = 0u64;
+    let mut total_lines = 0u64;
+    for (host, entries) in &hosts {
+        let lines: u64 = entries.iter().map(|b| b.count as u64).sum();
+        total_batches = total_batches.saturating_add(entries.len() as u64);
+        total_lines = total_lines.saturating_add(lines);
+        println!(
+            "{:<24} {:>8} {:>10} {:>12}",
+            host,
+            entries.len(),
+            lines,
+            entries.last().map(|b| b.sealed_at.as_str()).unwrap_or("-")
+        );
+    }
+
+    let mut unanchored = 0u64;
+    let mut oldest: Option<&str> = None;
+    for r in &index.roots {
+        if anchors
+            .get(&r.root_id)
+            .and_then(|l| proof::resolve_anchor(l))
+            .is_none()
+        {
+            unanchored = unanchored.saturating_add(1);
+            if oldest.is_none() {
+                oldest = Some(r.sealed_at.as_str());
+            }
+        }
+    }
+    let last = anchors
+        .values()
+        .filter_map(|l| proof::resolve_anchor(l))
+        .max_by_key(|a| a.root_id);
+
+    println!();
+    println!("hosts            {}", hosts.len());
+    println!("batches          {}", total_batches);
+    println!("committed lines  {}", total_lines);
+    println!("roots            {}", index.roots.len());
+    println!("pending root     {}", index.pending.len());
+    println!("roots unanchored {}", unanchored);
+    if let Some(sealed_at) = oldest {
+        println!("oldest unanchored sealed at {}", sealed_at);
+    }
+    match last {
+        Some(a) => println!(
+            "last anchor      root {} {} tx {} (chain {})",
+            a.root_id, a.phase, a.tx, a.chain_id
+        ),
+        None => println!("last anchor      none. Nothing is published on a chain yet."),
+    }
+    Ok(())
+}
+
+fn cmd_merkle_proof(
+    dir: &Path,
+    host: &str,
+    seq: u64,
+    segment: Option<u64>,
+    out: Option<&Path>,
+) -> Result<(), anyhow::Error> {
+    if !valid_host_id(host) {
+        anyhow::bail!("host id may only contain letters, digits, '-', '.', '_'");
+    }
+    let snap = proof::IndexSnapshot::from_disk(dir, host);
+    let bundles = proof::bundles_for(dir, &snap, host, seq, segment)
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+
+    // One match is the ordinary case and is emitted bare, which is the schema
+    // in server.md. More than one is a real answer -- seq is unique only within
+    // a segment -- so it is wrapped rather than silently reduced to the first.
+    let body = match bundles.len() {
+        1 => bundles.into_iter().next().unwrap_or(serde_json::Value::Null),
+        n => {
+            eprintln!(
+                "NOTE: {} records match {}/seq {}. They are in different segments; every one \
+                 is included.",
+                n, host, seq
+            );
+            json!({"v": 1, "count": n, "proofs": bundles})
+        }
+    };
+    let text = serde_json::to_string_pretty(&body)?;
+
+    match out {
+        Some(path) => {
+            std::fs::write(path, text.as_bytes())?;
+            eprintln!("wrote {:?}", path);
+        }
+        None => println!("{}", text),
+    }
+    Ok(())
+}
+
+fn cmd_merkle_verify(path: &Path, expect_root: Option<&str>) -> Result<(), anyhow::Error> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("cannot read {:?}: {}", path, e))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)?;
+
+    // Accept a bare bundle or the multi-match wrapper merkle-proof writes.
+    let bundles: Vec<serde_json::Value> = match value.get("proofs").and_then(|p| p.as_array()) {
+        Some(list) => list.clone(),
+        None => vec![value],
+    };
+
+    let mut all_ok = true;
+    for (i, bundle) in bundles.iter().enumerate() {
+        if bundles.len() > 1 {
+            println!("--- proof {} of {} ---", i + 1, bundles.len());
+        }
+        let (steps, mut ok) = proof::check_bundle(bundle);
+        for (pass, msg) in &steps {
+            println!("{} {}", if *pass { "PASS" } else { "FAIL" }, msg);
+        }
+        if let Some(want) = expect_root {
+            let got = bundle
+                .get("root")
+                .and_then(|r| r.get("root"))
+                .and_then(|r| r.as_str())
+                .unwrap_or("");
+            let matched = got.eq_ignore_ascii_case(want);
+            println!(
+                "{} root is {} (expected {})",
+                if matched { "PASS" } else { "FAIL" },
+                got,
+                want
+            );
+            ok &= matched;
+        }
+        all_ok &= ok;
+        println!();
+        println!("RESULT        {}", if ok { "the bundle is internally consistent" } else { "BROKEN" });
+        println!();
+        println!("What this does NOT prove:");
+        for claim in bundle
+            .get("not_claims")
+            .and_then(|c| c.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            println!("  - {}", claim.as_str().unwrap_or(""));
+        }
+        println!();
+        println!("This checked the hashes only. Whether the root is published on a chain is a");
+        println!("separate question: run `verify.py --proof {:?} --rpc-url <url>`.", path);
+    }
+
+    if !all_ok {
+        anyhow::bail!("the proof bundle does not verify");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------
 // Subcommands
 // ---------------------------------------------------------
 
@@ -1906,9 +2110,19 @@ fn cmd_enroll(
 
     // A forced re-enrollment resets chain position, otherwise every record
     // from the new agent fails against the old high-water mark forever.
+    //
+    // The COMMITMENT position is deliberately not reset with it. batches/ and
+    // events/ are one append-only file per host and they survive a
+    // re-enrollment; restarting batch_id at 0 would put two batch 0 lines in
+    // one file, re-anchor prev_chainhash to genesis mid-file, and leave every
+    // root's batch_lo..batch_hi range ambiguous. The record chain restarts; the
+    // batch chain does not.
     if force {
+        let previous = load_state(dir, host);
         let fresh = HostState {
             last_mac: GENESIS_MAC.to_string(),
+            batches: previous.batches,
+            last_chainhash: previous.last_chainhash,
             ..Default::default()
         };
         save_state(dir, host, &fresh);
@@ -2084,6 +2298,19 @@ async fn main() -> Result<(), anyhow::Error> {
         Command::Status => cmd_status(&cli.data_dir),
 
         Command::MerkleAudit { host } => cmd_merkle_audit(&cli.data_dir, host.as_deref()),
+
+        Command::MerkleStatus => cmd_merkle_status(&cli.data_dir),
+
+        Command::MerkleProof {
+            host,
+            seq,
+            segment,
+            out,
+        } => cmd_merkle_proof(&cli.data_dir, &host, seq, segment, out.as_deref()),
+
+        Command::MerkleVerify { proof, expect_root } => {
+            cmd_merkle_verify(&proof, expect_root.as_deref())
+        }
 
         Command::Serve {
             listen,
@@ -3676,5 +3903,515 @@ mod audit_tests {
         std::fs::write(&path, kept.join("\n") + "\n").unwrap_or_else(|e| panic!("{}", e));
 
         assert!(!audit(&dir.0, None).divergences.is_empty());
+    }
+}
+
+// ---------------------------------------------------------
+// Retrieval and proof bundles (server.md 2.9, step 8)
+// ---------------------------------------------------------
+//
+// The acceptance bar for this step is not "a bundle is produced". It is that a
+// bundle NEVER disagrees with the bytes on disk: a proof over altered bytes is
+// worse than no proof at all, so the tampering cases below are the ones that
+// matter most.
+#[cfg(test)]
+mod proof_tests {
+    use super::concurrency_tests::*;
+    use super::merkle_batch_tests::batch_lines;
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    const SEAL_NOW: usize = 1;
+
+    async fn ingest_n(app: &Arc<App>, host: &str, k0: &[u8; 32], from: u64, n: u64, prev: &str) -> String {
+        let (body, next) = batch(k0, from, n, prev);
+        assert_eq!(post_batch(app, host, body).await, StatusCode::OK);
+        next
+    }
+
+    fn snapshot_from_disk(dir: &Path, host: &str) -> proof::IndexSnapshot {
+        proof::IndexSnapshot::from_disk(dir, host)
+    }
+
+    /// Every step of an offline check must pass, or the bundle is worthless.
+    fn assert_bundle_verifies(bundle: &Value) {
+        let (steps, ok) = proof::check_bundle(bundle);
+        assert!(ok, "bundle did not verify: {:?}", steps);
+        assert!(steps.len() >= 4, "expected every link to be reported: {:?}", steps);
+    }
+
+    async fn get(app: &Arc<App>, uri: &str) -> (StatusCode, axum::http::HeaderMap, Value) {
+        let router = dashboard::routes(Arc::clone(app));
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap_or_else(|e| panic!("request builds: {}", e)),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("router responds: {}", e));
+        let status = res.status();
+        let headers = res.headers().clone();
+        let bytes = axum::body::to_bytes(res.into_body(), 32 * 1024 * 1024)
+            .await
+            .unwrap_or_else(|e| panic!("body reads: {}", e));
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, headers, value)
+    }
+
+    /// The whole point of the feature, end to end: ingest, seal, prove, and
+    /// check the proof with nothing but the bundle itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bundle_verifies_with_no_collector_and_no_k0() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [61u8; 32];
+        enroll_for_test(&dir.0, "web-01", &k0);
+        enroll_for_test(&dir.0, "db-02", &k0);
+
+        let prev = ingest_n(&app, "web-01", &k0, 1, 5, GENESIS_MAC).await;
+        ingest_n(&app, "web-01", &k0, 6, 5, &prev).await;
+        ingest_n(&app, "db-02", &k0, 1, 3, GENESIS_MAC).await;
+        assert_eq!(seal_once(&app, 0, SEAL_NOW).await, Some(0));
+
+        let snap = snapshot_from_disk(&dir.0, "web-01");
+        let bundles = proof::bundles_for(&dir.0, &snap, "web-01", 7, None)
+            .unwrap_or_else(|e| panic!("proof for seq 7: {}", e.message));
+        assert_eq!(bundles.len(), 1);
+        let bundle = bundles.first().unwrap_or_else(|| panic!("one bundle"));
+
+        assert_bundle_verifies(bundle);
+        assert_eq!(bundle["record"]["seq"], 7);
+        assert_eq!(bundle["collector_metadata"]["host"], "web-01");
+        assert_eq!(bundle["collector_metadata"]["verified"], true);
+        assert_eq!(bundle["batch"]["batch_id"], 1);
+        assert_eq!(bundle["batch"]["index"], 1, "seq 7 is the second line of batch 1");
+        assert_eq!(bundle["root"]["root_id"], 0);
+        // Three batches from two hosts are in the root; web-01 sorts after
+        // db-02, so its batches are leaves 1 and 2.
+        assert_eq!(bundle["root"]["leaf_count"], 3);
+        assert_eq!(bundle["anchor"]["status"], "pending");
+        assert_eq!(
+            bundle["not_claims"].as_array().map(Vec::len),
+            Some(3),
+            "every bundle carries the not_claims verbatim"
+        );
+        assert!(bundle["claims"].as_array().map(Vec::len).unwrap_or(0) >= 2);
+    }
+
+    /// The acceptance test this endpoint exists to pass: one altered byte and
+    /// the collector refuses to issue a proof, loudly, rather than serving a
+    /// plausible-looking one over bytes that no longer match its commitment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tampered_record_gets_no_proof() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [62u8; 32];
+        enroll_for_test(&dir.0, "web-01", &k0);
+        ingest_n(&app, "web-01", &k0, 1, 4, GENESIS_MAC).await;
+        assert_eq!(seal_once(&app, 0, SEAL_NOW).await, Some(0));
+
+        // Sanity: it proves before the edit.
+        let snap = snapshot_from_disk(&dir.0, "web-01");
+        assert!(proof::bundles_for(&dir.0, &snap, "web-01", 3, None).is_ok());
+
+        // One byte, inside a committed range: the process name of seq 3.
+        let path = events_path(&dir.0, "web-01");
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}", e));
+        let edited = raw.replacen("\"process_name\":\"bash\"", "\"process_name\":\"bash \"", 3);
+        assert_ne!(edited, raw);
+        std::fs::write(&path, &edited).unwrap_or_else(|e| panic!("{}", e));
+
+        let err = proof::bundles_for(&dir.0, &snap, "web-01", 3, None)
+            .err()
+            .unwrap_or_else(|| panic!("a proof was served over altered bytes"));
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message.contains("does not match the commitment"), "{}", err.message);
+
+        // And over HTTP, where it must be a 500 rather than a 404 or a proof.
+        let (code, _, body) = get(&app, "/api/merkle/record?host=web-01&seq=3").await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body["error"].is_string());
+    }
+
+    /// A deleted line inside a committed range shifts every leaf after it, so
+    /// the range no longer holds what the batch counted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deleted_line_gets_no_proof() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [63u8; 32];
+        enroll_for_test(&dir.0, "web-01", &k0);
+        ingest_n(&app, "web-01", &k0, 1, 4, GENESIS_MAC).await;
+
+        let path = events_path(&dir.0, "web-01");
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}", e));
+        let kept: Vec<&str> = raw.lines().enumerate().filter(|(i, _)| *i != 1).map(|(_, l)| l).collect();
+        std::fs::write(&path, kept.join("\n") + "\n").unwrap_or_else(|e| panic!("{}", e));
+
+        let snap = snapshot_from_disk(&dir.0, "web-01");
+        let err = proof::bundles_for(&dir.0, &snap, "web-01", 4, None)
+            .err()
+            .unwrap_or_else(|| panic!("a proof was served after a line was deleted"));
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Markers are leaves too. A CHAIN_BREAK ahead of a record shifts that
+    /// record's leaf index by one, and a proof that counted only records would
+    /// replay to the wrong chainhash -- which is exactly why the index counts
+    /// every committed line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_chain_break_marker_is_a_committed_leaf() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [64u8; 32];
+        enroll_for_test(&dir.0, "web-01", &k0);
+        ingest_n(&app, "web-01", &k0, 1, 2, GENESIS_MAC).await;
+
+        // seq 3 with a prev_hash that points nowhere: a break, then the record.
+        let mut broken = seal_one(&k0, 3, &"ff".repeat(32));
+        broken.hash = edr_record::record_mac(&k0, &broken);
+        let body = serde_json::to_string(&broken).unwrap_or_else(|e| panic!("{}", e)) + "\n";
+        assert_eq!(post_batch(&app, "web-01", body).await, StatusCode::CONFLICT);
+        assert_eq!(seal_once(&app, 0, SEAL_NOW).await, Some(0));
+
+        let batches = batch_lines(&dir.0, "web-01");
+        let second = batches.get(1).unwrap_or_else(|| panic!("two batches"));
+        assert_eq!(second.count, 2, "the marker and the record are both committed");
+
+        let snap = snapshot_from_disk(&dir.0, "web-01");
+        let bundles = proof::bundles_for(&dir.0, &snap, "web-01", 3, None)
+            .unwrap_or_else(|e| panic!("proof for the record after a break: {}", e.message));
+        let bundle = bundles.first().unwrap_or_else(|| panic!("one bundle"));
+        assert_eq!(bundle["batch"]["index"], 1, "the marker is leaf 0");
+        assert_eq!(bundle["collector_metadata"]["verified"], false);
+        assert_bundle_verifies(bundle);
+    }
+
+    /// Before a root exists the bundle is still worth serving, and it says so:
+    /// a batch commitment this collector cannot retroactively change, but
+    /// nothing outside the collector pinning it yet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unrooted_batch_proves_only_to_its_chainhash() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [65u8; 32];
+        enroll_for_test(&dir.0, "web-01", &k0);
+        ingest_n(&app, "web-01", &k0, 1, 3, GENESIS_MAC).await;
+
+        let snap = snapshot_from_disk(&dir.0, "web-01");
+        let bundles = proof::bundles_for(&dir.0, &snap, "web-01", 2, None)
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        let bundle = bundles.first().unwrap_or_else(|| panic!("one bundle"));
+        assert!(bundle["root"]["root_id"].is_null());
+        assert_eq!(bundle["anchor"]["status"], "unsealed");
+        assert_bundle_verifies(bundle);
+    }
+
+    /// `seq` is unique only within a segment, and `enroll --force` can repeat
+    /// even that. Both matches come back rather than one guessed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_match_for_a_repeated_seq_is_returned() {
+        let dir = temp_dir();
+        let k0 = [66u8; 32];
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        enroll_for_test(&dir.0, "web-01", &k0);
+        ingest_n(&app, "web-01", &k0, 1, 3, GENESIS_MAC).await;
+        drop(app);
+
+        // A forced re-enrollment: the record chain restarts at seq 1, the batch
+        // chain carries on.
+        cmd_enroll(&dir.0, "web-01", &hex_of(&k0), None, true).unwrap_or_else(|e| panic!("{}", e));
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        ingest_n(&app, "web-01", &k0, 1, 3, GENESIS_MAC).await;
+        assert_eq!(seal_once(&app, 0, SEAL_NOW).await, Some(0));
+
+        let batches = batch_lines(&dir.0, "web-01");
+        assert_eq!(batches.len(), 2);
+        let (Some(a), Some(b)) = (batches.first(), batches.get(1)) else {
+            panic!("two batches")
+        };
+        assert_eq!(b.batch_id, 1, "a forced re-enrollment must not reuse batch 0");
+        assert_eq!(b.prev_chainhash, a.chainhash, "the batch chain survives re-enrollment");
+        assert!(audit(&dir.0, Some("web-01")).divergences.is_empty());
+
+        let snap = snapshot_from_disk(&dir.0, "web-01");
+        let bundles = proof::bundles_for(&dir.0, &snap, "web-01", 2, None)
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        assert_eq!(bundles.len(), 2, "both records carrying seq 2 must be returned");
+        for bundle in &bundles {
+            assert_bundle_verifies(bundle);
+        }
+    }
+
+    /// A read must never sit behind an ingest fsync. The events file is
+    /// append-only, so serving a proof needs no host lock at all -- this parks
+    /// the host lock and proves a proof still comes back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_proof_does_not_stall_behind_an_ingest() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [67u8; 32];
+        enroll_for_test(&dir.0, "web-01", &k0);
+        ingest_n(&app, "web-01", &k0, 1, 3, GENESIS_MAC).await;
+        assert_eq!(seal_once(&app, 0, SEAL_NOW).await, Some(0));
+
+        // Hold the host's own lock, as a mid-fsync ingest would.
+        let entry = app.host_entry("web-01").await.unwrap_or_else(|_| panic!("enrolled"));
+        let held = entry.lock().await;
+
+        let (code, _, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            get(&app, "/api/merkle/record?host=web-01&seq=2"),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the proof request waited on the host lock"));
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["count"], 1);
+        drop(held);
+    }
+
+    /// Shape, status codes and headers of the HTTP surface.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_read_api_answers_and_never_caches() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [68u8; 32];
+        enroll_for_test(&dir.0, "web-01", &k0);
+        ingest_n(&app, "web-01", &k0, 1, 4, GENESIS_MAC).await;
+        assert_eq!(seal_once(&app, 0, SEAL_NOW).await, Some(0));
+
+        let (code, headers, body) = get(&app, "/api/merkle/record?host=web-01&seq=2").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            headers.get(axum::http::header::CACHE_CONTROL).map(|v| v.as_bytes()),
+            Some(b"no-store".as_slice()),
+            "a proof bundle is record content and must not be cached"
+        );
+        assert_eq!(body["count"], 1);
+        let bundle = &body["proofs"][0];
+        assert_bundle_verifies(bundle);
+
+        // Bad input is a 4xx with JSON, never a panic (PANIC POLICY).
+        assert_eq!(get(&app, "/api/merkle/record?host=../etc&seq=1").await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(get(&app, "/api/merkle/record?host=web-01").await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(get(&app, "/api/merkle/record?host=web-01&seq=9999").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get(&app, "/api/merkle/record?host=nope&seq=1").await.0, StatusCode::NOT_FOUND);
+
+        let (code, _, status) = get(&app, "/api/merkle/status").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(status["batches"], 1);
+        assert_eq!(status["roots"], 1);
+        assert_eq!(status["roots_unanchored"], 1);
+        assert_eq!(status["batches_pending_root"], 0);
+        assert!(status["oldest_unanchored_age_secs"].is_number());
+
+        let (code, _, batch) = get(&app, "/api/merkle/batch/web-01/0").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(batch["count"], 4);
+        assert_eq!(batch["leaves"].as_array().map(Vec::len), Some(4));
+        assert_eq!(batch["root_id"], 0);
+        assert_eq!(get(&app, "/api/merkle/batch/web-01/9").await.0, StatusCode::NOT_FOUND);
+
+        let (code, _, roots) = get(&app, "/api/merkle/roots?limit=5").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(roots["count"], 1);
+        assert_eq!(roots["roots"][0]["anchor"]["status"], "pending");
+
+        let (code, _, root) = get(&app, "/api/merkle/root/0").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(root["covers"][0]["host"], "web-01");
+        assert_eq!(get(&app, "/api/merkle/root/7").await.0, StatusCode::NOT_FOUND);
+
+        let (code, _, records) = get(&app, "/api/merkle/records?host=web-01&from_seq=2&to_seq=3&include_proof=true").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(records["count"], 2);
+        assert_bundle_verifies(&records["records"][0]["proof"]);
+        assert_eq!(
+            get(&app, "/api/merkle/records?host=web-01&from_seq=9&to_seq=2").await.0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let (code, _, audit) = get(&app, "/api/merkle/audit?host=web-01").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(audit["intact"], true);
+        assert_eq!(audit["divergences"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// With an anchor on disk the bundle carries the transaction, the claims
+    /// name the block, and the reverse lookup resolves the tx to its records.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_anchored_root_shows_up_in_the_bundle_and_in_reverse() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [69u8; 32];
+        enroll_for_test(&dir.0, "web-01", &k0);
+        ingest_n(&app, "web-01", &k0, 1, 3, GENESIS_MAC).await;
+        assert_eq!(seal_once(&app, 0, SEAL_NOW).await, Some(0));
+
+        let root_hex = {
+            let index = app.merkle.lock().await;
+            index.last_root.clone()
+        };
+        let anchors = format!(
+            "{}\n{}\n",
+            json!({"v":1,"phase":"submitted","root_id":0,"root":root_hex,"chain_id":84532,
+                   "from":"0xabc","nonce":7,"tx":"0x5f","submitted_at":"2026-08-27T09:20:11Z"}),
+            json!({"v":1,"phase":"confirmed","root_id":0,"root":root_hex,"chain_id":84532,
+                   "tx":"0x5f","block_number":21883014,"block_hash":"0x77",
+                   "block_time":"2026-08-27T09:20:37Z","confirmations":12,
+                   "confirmed_at":"2026-08-27T09:24:02Z"})
+        );
+        std::fs::write(proof::anchors_path(&dir.0), anchors).unwrap_or_else(|e| panic!("{}", e));
+
+        let (_, _, body) = get(&app, "/api/merkle/record?host=web-01&seq=1").await;
+        let bundle = &body["proofs"][0];
+        assert_bundle_verifies(bundle);
+        assert_eq!(bundle["anchor"]["status"], "confirmed");
+        assert_eq!(bundle["anchor"]["chain_name"], "base-sepolia");
+        assert_eq!(bundle["anchor"]["block_number"], 21883014);
+        // Carried forward from the submission of the same tx: the confirmation
+        // line names only the block, but a verifier checks `to == from` against
+        // the account it expects to see anchoring.
+        assert_eq!(bundle["anchor"]["from"], "0xabc");
+        assert_eq!(bundle["anchor"]["nonce"], 7);
+        let claims = bundle["claims"][0].as_str().unwrap_or("");
+        assert!(claims.contains("21883014"), "{}", claims);
+
+        let (code, _, status) = get(&app, "/api/merkle/status").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(status["roots_unanchored"], 0);
+        assert_eq!(status["last_anchor"]["tx"], "0x5f");
+
+        let (code, _, tx) = get(&app, "/api/merkle/tx/0x5f").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(tx["root_id"], 0);
+        assert_eq!(tx["covers"][0]["host"], "web-01");
+        assert_eq!(tx["covers"][0]["seq_lo"], 1);
+        assert_eq!(tx["covers"][0]["seq_hi"], 3);
+        assert_eq!(get(&app, "/api/merkle/tx/0xdeadbeef").await.0, StatusCode::NOT_FOUND);
+    }
+
+    /// The anchor worker's heartbeat, surfaced for the dashboard. A worker
+    /// that is stuck, unfunded or not running at all looks exactly like a
+    /// working one unless something says otherwise.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_anchor_workers_heartbeat_is_surfaced() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [72u8; 32];
+        enroll_for_test(&dir.0, "web-01", &k0);
+        ingest_n(&app, "web-01", &k0, 1, 2, GENESIS_MAC).await;
+
+        // Absent is a legitimate answer and must not break the endpoint.
+        let (code, _, before) = get(&app, "/api/merkle/status").await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(before["anchor_worker"].is_null());
+        assert_eq!(before["batches_pending_root"], 1);
+
+        std::fs::write(
+            dir.0.join("anchor-status.json"),
+            json!({
+                "address": "0xabc", "chain_id": 84532,
+                "anchor_balance_wei": "900000000000000", "balance_low": true,
+                "roots_total": 4, "roots_unanchored": 3, "in_flight": 1,
+                "checked_at": "2026-08-28T09:00:00+00:00"
+            })
+            .to_string(),
+        )
+        .unwrap_or_else(|e| panic!("{}", e));
+
+        let (_, _, after) = get(&app, "/api/merkle/status").await;
+        assert_eq!(after["anchor_worker"]["balance_low"], true);
+        assert_eq!(after["anchor_worker"]["anchor_balance_wei"], "900000000000000");
+        assert_eq!(after["anchor_worker"]["chain_id"], 84532);
+
+        // Unparseable is null rather than a 500: a corrupt heartbeat must not
+        // take the whole read API down with it.
+        std::fs::write(dir.0.join("anchor-status.json"), "{not json")
+            .unwrap_or_else(|e| panic!("{}", e));
+        let (code, _, broken) = get(&app, "/api/merkle/status").await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(broken["anchor_worker"].is_null());
+    }
+
+    /// A bundle that has been edited must fail the offline check. This is the
+    /// mutation guard on `check_bundle` itself: if it passed anything, every
+    /// test above would pass vacuously.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_edited_bundle_fails_the_offline_check() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [70u8; 32];
+        enroll_for_test(&dir.0, "web-01", &k0);
+        ingest_n(&app, "web-01", &k0, 1, 5, GENESIS_MAC).await;
+        assert_eq!(seal_once(&app, 0, SEAL_NOW).await, Some(0));
+
+        let snap = snapshot_from_disk(&dir.0, "web-01");
+        let bundles = proof::bundles_for(&dir.0, &snap, "web-01", 3, None)
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        let good = bundles.first().cloned().unwrap_or(Value::Null);
+        assert_bundle_verifies(&good);
+
+        // Every one of these is a lie a proof could be asked to tell.
+        let mutations: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+            ("the record's process name", Box::new(|b: &mut Value| b["record"]["process_name"] = json!("sh"))),
+            // 4242 rather than 0: the fixture's uid IS 0, and a mutation that
+            // changes nothing would make this whole test pass vacuously.
+            ("the record's uid", Box::new(|b: &mut Value| b["record"]["uid"] = json!(4242))),
+            ("the leaf hash", Box::new(|b: &mut Value| b["leaf"]["hash"] = json!("00".repeat(32)))),
+            ("the leaf index", Box::new(|b: &mut Value| b["batch"]["index"] = json!(0))),
+            ("the batch chainhash", Box::new(|b: &mut Value| b["batch"]["chainhash"] = json!("11".repeat(32)))),
+            ("a sibling in the batch path", Box::new(|b: &mut Value| b["batch"]["path"][0]["h"] = json!("22".repeat(32)))),
+            ("the side of a sibling", Box::new(|b: &mut Value| {
+                let side = b["batch"]["path"][0]["left"].as_bool().unwrap_or(false);
+                b["batch"]["path"][0]["left"] = json!(!side);
+            })),
+            ("the host the batch leaf binds", Box::new(|b: &mut Value| b["batch"]["host"] = json!("other-host"))),
+            ("the batch id the batch leaf binds", Box::new(|b: &mut Value| b["batch"]["batch_id"] = json!(99))),
+            ("the sealed root", Box::new(|b: &mut Value| b["root"]["root"] = json!("33".repeat(32)))),
+            ("the level-2 index", Box::new(|b: &mut Value| b["root"]["index"] = json!(1))),
+        ];
+        for (what, mutate) in mutations {
+            let mut bad = good.clone();
+            mutate(&mut bad);
+            let (steps, ok) = proof::check_bundle(&bad);
+            assert!(!ok, "editing {} went undetected: {:?}", what, steps);
+        }
+    }
+
+    /// The CLI writes a bundle a third party can take away, and reads one back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cli_round_trips_a_bundle() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [71u8; 32];
+        enroll_for_test(&dir.0, "web-01", &k0);
+        ingest_n(&app, "web-01", &k0, 1, 4, GENESIS_MAC).await;
+        assert_eq!(seal_once(&app, 0, SEAL_NOW).await, Some(0));
+
+        let out = dir.0.join("proof.json");
+        cmd_merkle_proof(&dir.0, "web-01", 2, None, Some(&out))
+            .unwrap_or_else(|e| panic!("merkle-proof: {}", e));
+        let root_hex = {
+            let index = app.merkle.lock().await;
+            index.last_root.clone()
+        };
+        cmd_merkle_verify(&out, Some(&root_hex)).unwrap_or_else(|e| panic!("merkle-verify: {}", e));
+        cmd_merkle_status(&dir.0).unwrap_or_else(|e| panic!("merkle-status: {}", e));
+
+        // A different root must be refused.
+        assert!(cmd_merkle_verify(&out, Some(&"ab".repeat(32))).is_err());
+
+        // And a bundle whose record was edited on the way out.
+        let raw = std::fs::read_to_string(&out).unwrap_or_else(|e| panic!("{}", e));
+        let mut bundle: Value = serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{}", e));
+        bundle["record"]["pid"] = json!(4242);
+        std::fs::write(&out, bundle.to_string()).unwrap_or_else(|e| panic!("{}", e));
+        assert!(cmd_merkle_verify(&out, None).is_err(), "an edited record must fail");
     }
 }
