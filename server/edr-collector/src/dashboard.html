@@ -244,6 +244,7 @@
 
 <div class="pad">
   <div class="grid tiles" id="tiles"></div>
+  <p class="meta" id="anchorbar"></p>
   <div class="grid charts" id="charts"></div>
 </div>
 
@@ -496,10 +497,14 @@ function renderCharts(fleet) {
 
 // ---------- rendering ----------
 
-function renderTiles(fleet, hosts) {
+function renderTiles(fleet, hosts, merkle) {
   const unver = state.rows.filter((r) => r.verified === false).length;
   const crit = state.rows.filter((r) => r.severity === "CRITICAL").length;
   const mism = hosts.filter((h) => h.build_mismatch).length;
+  const unanchored = merkle.roots_unanchored || 0;
+  // A backlog is normal: a root waits up to --root-interval-secs, plus however
+  // long the worker takes to confirm it. Hours of backlog is a stuck worker.
+  const stale = (merkle.oldest_unanchored_age_secs || 0) > 3600;
 
   const defs = [
     ["Hosts", fleet.enrolled, ""],
@@ -509,6 +514,8 @@ function renderTiles(fleet, hosts) {
     ["Unsealed in view", unver, unver > 0 ? "bad" : "good"],
     ["Critical in view", crit, crit > 0 ? "bad" : ""],
     ["Build mismatch", mism, mism > 0 ? "bad" : "good"],
+    ["Roots", merkle.roots || 0, ""],
+    ["Unanchored", unanchored, stale ? "bad" : (unanchored > 0 ? "" : "good")],
   ];
 
   const box = $("tiles");
@@ -525,7 +532,67 @@ function renderTiles(fleet, hosts) {
   box.append(t);
 }
 
-function renderBanner(fleet, hosts) {
+/// What the commitment layer is doing, in one line.
+///
+/// textContent only, like everything else on this page: the strings below are
+/// ours, but the habit is what keeps an attacker-chosen field from ever being
+/// parsed as markup.
+function renderAnchors(merkle) {
+  const bar = $("anchorbar");
+  if (!merkle || merkle.merkle === "off") {
+    bar.textContent = "Merkle batching is off — records are stored but committed to nothing.";
+    return;
+  }
+  const parts = [
+    (merkle.batches || 0) + " batches",
+    (merkle.roots || 0) + " roots",
+    (merkle.batches_pending_root || 0) + " batches awaiting a root",
+  ];
+  const last = merkle.last_anchor;
+  if (last) {
+    parts.push("last anchor: root " + last.root_id + " " + last.status +
+               " in block " + (last.block_number || "?") +
+               " on " + (last.chain_name || last.chain_id) +
+               " (" + String(last.tx).slice(0, 12) + "…)");
+  } else {
+    parts.push("nothing anchored yet — roots are sealed but not published");
+  }
+  if (merkle.roots_unanchored) {
+    parts.push(merkle.roots_unanchored + " unanchored, oldest " +
+               fmtAge(merkle.oldest_unanchored_age_secs));
+  }
+  const worker = merkle.anchor_worker;
+  if (worker) {
+    parts.push("worker balance " + fmtWei(worker.anchor_balance_wei) +
+               (worker.balance_low ? " (LOW)" : "") +
+               ", checked " + ago(worker.checked_at));
+  } else {
+    parts.push("anchor worker has never run against this data directory");
+  }
+  bar.textContent = "Commitments: " + parts.join("  ·  ");
+}
+
+function fmtAge(secs) {
+  if (secs === null || secs === undefined) return "unknown";
+  if (secs < 90) return secs + "s";
+  if (secs < 5400) return Math.round(secs / 60) + "m";
+  return Math.round(secs / 3600) + "h";
+}
+
+/// Wei as ETH, to four places. BigInt because 1e18 does not fit a double and a
+/// balance rendered as 0.1000000000000000055 reads as a bug.
+function fmtWei(wei) {
+  try {
+    const v = BigInt(wei || "0");
+    const whole = v / 1000000000000000000n;
+    const frac = (v % 1000000000000000000n) / 100000000000000n;
+    return whole + "." + String(frac).padStart(4, "0") + " ETH";
+  } catch (e) {
+    return String(wei);
+  }
+}
+
+function renderBanner(fleet, hosts, merkle) {
   const b = $("banner");
   const problems = [];
   if (fleet.total_breaks > 0) {
@@ -537,6 +604,15 @@ function renderBanner(fleet, hosts) {
   const mism = hosts.filter((h) => h.build_mismatch);
   if (mism.length) {
     problems.push(mism.length + " host(s) running an unenrolled agent binary");
+  }
+  // Not data loss -- roots keep accumulating and anchor later -- but proofs
+  // issued meanwhile carry no independent timestamp, so it has to be visible.
+  if (merkle && (merkle.oldest_unanchored_age_secs || 0) > 3600) {
+    problems.push("a root has been waiting " + fmtAge(merkle.oldest_unanchored_age_secs) +
+                  " to be anchored — the anchor worker is stuck, unfunded, or not running");
+  }
+  if (merkle && merkle.anchor_worker && merkle.anchor_worker.balance_low) {
+    problems.push("the anchor account is nearly out of gas");
   }
   if (problems.length) {
     b.textContent = "INTEGRITY ALERT: " + problems.join("  ·  ");
@@ -673,17 +749,21 @@ async function refresh() {
     if (state.all) params.set("all", "true");
     params.set("limit", "500");
 
-    const [ov, al] = await Promise.all([
+    const [ov, al, mk] = await Promise.all([
       fetch("api/overview").then((r) => r.json()),
       fetch("api/alerts?" + params.toString()).then((r) => r.json()),
+      // Never fatal: an older collector without the retrieval API still shows
+      // its alerts rather than reporting itself unreachable.
+      fetch("api/merkle/status").then((r) => r.json()).catch(() => ({})),
     ]);
 
     state.rows = Array.isArray(al.alerts) ? al.alerts : [];
     state.hosts = ov.hosts || [];
     renderHosts(state.hosts);
-    renderTiles(ov.fleet || {}, state.hosts);
+    renderTiles(ov.fleet || {}, state.hosts, mk || {});
     renderCharts(ov.fleet || {});
-    renderBanner(ov.fleet || {}, state.hosts);
+    renderAnchors(mk || {});
+    renderBanner(ov.fleet || {}, state.hosts, mk || {});
     renderRows();
 
     $("updated").textContent = "updated " + shortTime(new Date().toISOString());

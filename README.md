@@ -14,11 +14,17 @@ agent/      the endpoint half. eBPF probe on sched_process_exec, forward-secure
             └─ edr-agent, edr-agent-ebpf, edr-agent-common (kernel ABI)
 
 server/     the off-box half. Verifies each shipped record against the host's
-            escrowed K0, appends it to an NDJSON store, serves the analyst
-            dashboard. Stable toolchain, no eBPF, no root.
-            └─ edr-collector
+            escrowed K0, appends it to an NDJSON store, commits every accepted
+            batch to a Merkle tree, serves the analyst dashboard and the proof
+            retrieval API. Stable toolchain, no eBPF, no root.
+            ├─ edr-collector — ingest, storage, commitments, dashboard, proofs
+            └─ edr-anchor    — publishes periodic roots to a blockchain. The
+               only component that holds a private key or reaches a chain, and
+               a separate binary and unix user for exactly that reason.
 
 verify.py   standalone offline verifier, stdlib only. Mirrors protocol/ by hand.
+            Two modes: --key checks authenticity against K0; --proof checks a
+            commitment with no K0 and no access to the collector at all.
 ```
 
 Each of `agent/`, `server/` and `protocol/` is its own cargo workspace with its
@@ -70,14 +76,34 @@ log, so the failure mode of an unreachable or overloaded collector is delay,
 never data loss.
 
 **Server, read-only.** `GET /v1/status`, `GET /healthz` on the ingest socket;
-`GET /`, `/api/overview`, `/api/alerts`, `/api/host/{host}` on a **separate**
-dashboard socket that must never be reachable from the agent side.
+`GET /`, `/api/overview`, `/api/alerts`, `/api/host/{host}` and the retrieval
+API (`/api/merkle/status`, `/api/merkle/record`, `/api/merkle/records`,
+`/api/merkle/batch/{host}/{id}`, `/api/merkle/roots`, `/api/merkle/root/{id}`,
+`/api/merkle/tx/{hash}`, `/api/merkle/audit`) on a **separate** dashboard socket
+that must never be reachable from the agent side. Proof endpoints enumerate
+records, so they belong on the analyst side with everything else that does.
+
+**Anyone, given a proof bundle.** A bundle from `/api/merkle/record` or
+`edr-collector merkle-proof` is checkable with no K0, no collector and no
+credential:
+
+```shell
+verify.py --proof proof.json                          # hashes only, offline
+verify.py --proof proof.json --rpc-url https://…      # …and against the chain
+```
+
+It proves those exact record bytes were committed to a root published on chain
+before a given block. It does not prove the record is authentic (that is the
+HMAC under K0), does not prove when the event happened, and cannot see a record
+dropped before it was ever batched. Every bundle carries those three limits
+verbatim.
 
 **Out of band.** The root key `K0` is escrowed on the server by
 `edr-collector enroll` and never crosses the network in either direction.
 
 `server.md` specifies the Merkle-batching, blockchain-anchoring and proof
-retrieval work planned on top of the server half.
+retrieval layer; `server/edr-anchor/README.md` covers deploying the anchor
+worker, including the unix isolation that keeps it away from K0.
 
 ## License
 
