@@ -87,6 +87,16 @@ enum Command {
         /// anything ingested while it was off.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         merkle: bool,
+        /// Seal a fleet-wide root at least this often, when anything is
+        /// pending. Trades gas cost against worst-case proof latency: a record
+        /// is not independently timestamped until the root covering it is
+        /// anchored.
+        #[arg(long, default_value_t = 600)]
+        root_interval_secs: u64,
+        /// ...or as soon as this many batches are waiting, whichever comes
+        /// first. Bounds how much is riding on a single unsealed queue.
+        #[arg(long, default_value_t = 256)]
+        root_max_batches: usize,
         /// Where to serve the read-only dashboard. Deliberately a SEPARATE
         /// socket from --listen: the ingest port must be reachable by the
         /// proxy, and the proxy is not trusted. Sharing one port would let it
@@ -120,6 +130,16 @@ enum Command {
     },
     /// Print per-host state.
     Status,
+    /// Recompute every commitment from the stored bytes and report drift.
+    ///
+    /// This is the one an auditor runs. It re-derives every batch chainhash
+    /// from the actual bytes in `events/{host}.ndjson` and every root from the
+    /// chainhashes those roots name, and needs no K0 to do it.
+    MerkleAudit {
+        /// Audit one host instead of every host that has batches.
+        #[arg(long)]
+        host: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------
@@ -275,6 +295,44 @@ struct BatchLine {
     leaves: Vec<String>,
 }
 
+/// Which of one host's batches a root covers, and their chainhashes.
+///
+/// The chainhashes are stored so proof generation never has to reach back into
+/// a host's files -- which is also what lets the root sealer run without ever
+/// taking a host lock.
+#[derive(Serialize, Deserialize, Clone)]
+struct RootCover {
+    host: String,
+    batch_lo: u64,
+    batch_hi: u64,
+    chainhashes: Vec<String>,
+}
+
+/// One line of `roots.ndjson`: the periodic, FLEET-WIDE commitment over every
+/// batch sealed since the last root.
+///
+/// Fleet-wide rather than per host on purpose. One root per interval is one
+/// blockchain transaction per interval no matter how many hosts are enrolled;
+/// per-host roots would make anchoring cost scale with fleet size, which looks
+/// fine with one host and is unaffordable with two hundred. Cross-host leaf
+/// substitution is prevented instead by binding the host id into the level-2
+/// leaf preimage (`merkle::batch_leaf`).
+#[derive(Serialize, Deserialize)]
+struct RootLine {
+    v: u32,
+    root_id: u64,
+    sealed_at: String,
+    root: String,
+    /// Previous root, GENESIS_MAC for root_id 0. Deleting a whole root line is
+    /// visible from this alone, without consulting the chain.
+    prev_root: String,
+    leaf_count: u64,
+    /// Hosts ascending, batches ascending within a host. THIS IS THE ORDER THE
+    /// LEVEL-2 LEAF VECTOR IS BUILT IN and it is part of the format: a verifier
+    /// that sorts differently computes a different root and every proof fails.
+    covers: Vec<RootCover>,
+}
+
 /// What the in-memory index keeps per batch. Deliberately not the leaves --
 /// only where to find them.
 ///
@@ -298,22 +356,112 @@ struct BatchIndexEntry {
     line_offset: u64,
 }
 
+/// Where one sealed root lives and what it covers. The `covers` ranges are the
+/// batch -> root mapping; nothing is ever written back into a batch line.
+#[allow(dead_code)]
+#[derive(Clone)]
+struct RootIndexEntry {
+    root_id: u64,
+    sealed_at: String,
+    root: String,
+    /// Byte offset of this line within `roots.ndjson`.
+    line_offset: u64,
+    /// (host, batch_lo, batch_hi).
+    covers: Vec<(String, u64, u64)>,
+}
+
+/// A batch that has been sealed but is not yet in a root.
+///
+/// The chainhash is cached here at ingest precisely so the root sealer needs no
+/// host lock and no file read to build a root. That is what keeps the lock
+/// graph acyclic (see LOCK ORDER).
+#[derive(Clone)]
+struct PendingBatch {
+    host: String,
+    batch_id: u64,
+    chainhash: [u8; 32],
+}
+
 /// Cross-host Merkle state. The one thing here that is genuinely shared, and so
 /// the one place many agents contend.
 ///
 /// ponytail: rebuilt by a full scan at startup. At 500 records per batch, a
 /// year of one busy host is ~60k lines -- fine to walk. Add a checkpoint file
 /// if boot time ever becomes noticeable.
-#[derive(Default)]
 struct MerkleIndex {
     /// Per host, ordered by batch_id, which is also insertion order.
     batches: HashMap<String, Vec<BatchIndexEntry>>,
+    /// Ordered by root_id.
+    roots: Vec<RootIndexEntry>,
+    /// Sealed but not yet rooted, in the order the batches were sealed. Append
+    /// only at the tail; the sealer removes a prefix. That is what makes
+    /// "remove exactly the ones I sealed" a `drain(..n)` even though ingest
+    /// keeps pushing while the sealer has the lock released.
+    pending: Vec<PendingBatch>,
+    next_root_id: u64,
+    /// Previous root's hash, GENESIS_MAC when none has been sealed.
+    last_root: String,
+    /// When the last root was sealed, for the interval trigger. Starts at
+    /// process start, so a restart does not immediately seal a one-batch root.
+    last_seal: std::time::Instant,
+}
+
+impl Default for MerkleIndex {
+    fn default() -> Self {
+        MerkleIndex {
+            batches: HashMap::new(),
+            roots: Vec::new(),
+            pending: Vec::new(),
+            next_root_id: 0,
+            last_root: GENESIS_MAC.to_string(),
+            last_seal: std::time::Instant::now(),
+        }
+    }
 }
 
 impl MerkleIndex {
-    /// Single sequential pass over every `batches/*.ndjson` at startup.
+    /// Single sequential pass over `roots.ndjson` and every
+    /// `batches/*.ndjson` at startup.
+    ///
+    /// Roots are read first because a batch is pending exactly when no root
+    /// covers it. Roots seal a host's batches in ascending order, so "covered"
+    /// is always a prefix per host and the highest covered batch_id is all that
+    /// needs remembering.
     fn load(dir: &Path) -> Self {
         let mut index = MerkleIndex::default();
+        let mut covered: HashMap<String, u64> = HashMap::new();
+
+        if let Ok(raw) = std::fs::read_to_string(roots_path(dir)) {
+            let mut offset = 0u64;
+            for line in raw.split_inclusive('\n') {
+                let start = offset;
+                offset = offset.saturating_add(line.len() as u64);
+                let Ok(r) = serde_json::from_str::<RootLine>(line.trim_end()) else {
+                    if !line.trim().is_empty() {
+                        eprintln!("CRITICAL: unparseable root line at byte {}", start);
+                    }
+                    continue;
+                };
+                for c in &r.covers {
+                    let slot = covered.entry(c.host.clone()).or_insert(c.batch_hi);
+                    *slot = (*slot).max(c.batch_hi);
+                }
+                index.next_root_id = index.next_root_id.max(r.root_id.saturating_add(1));
+                index.last_root = r.root.clone();
+                index.roots.push(RootIndexEntry {
+                    root_id: r.root_id,
+                    sealed_at: r.sealed_at,
+                    root: r.root,
+                    line_offset: start,
+                    covers: r
+                        .covers
+                        .into_iter()
+                        .map(|c| (c.host, c.batch_lo, c.batch_hi))
+                        .collect(),
+                });
+            }
+        }
+
         let Ok(entries) = std::fs::read_dir(dir.join("batches")) else {
             return index;
         };
@@ -337,6 +485,23 @@ impl MerkleIndex {
                     }
                     continue;
                 };
+                let rooted = match covered.get(host) {
+                    Some(hi) => b.batch_id <= *hi,
+                    None => false,
+                };
+                if !rooted {
+                    match unhex(&b.chainhash) {
+                        Some(chainhash) => index.pending.push(PendingBatch {
+                            host: host.to_string(),
+                            batch_id: b.batch_id,
+                            chainhash,
+                        }),
+                        None => eprintln!(
+                            "CRITICAL: batch {} for {} has an unusable chainhash; it cannot be rooted",
+                            b.batch_id, host
+                        ),
+                    }
+                }
                 list.push(BatchIndexEntry {
                     batch_id: b.batch_id,
                     seq_lo: b.seq_lo,
@@ -353,6 +518,12 @@ impl MerkleIndex {
                 index.batches.insert(host.to_string(), list);
             }
         }
+        // read_dir hands hosts back in whatever order the filesystem likes;
+        // the sealer sorts again before hashing, but a deterministic pending
+        // order keeps the drain-a-prefix invariant easy to reason about.
+        index
+            .pending
+            .sort_by(|a, b| a.host.cmp(&b.host).then(a.batch_id.cmp(&b.batch_id)));
         index
     }
 }
@@ -519,6 +690,24 @@ fn hex_string(bytes: &[u8; 32]) -> String {
 
 fn batches_path(dir: &Path, host: &str) -> PathBuf {
     dir.join("batches").join(format!("{}.ndjson", host))
+}
+
+/// Global, not per host: level 2 is fleet-wide.
+fn roots_path(dir: &Path) -> PathBuf {
+    dir.join("roots.ndjson")
+}
+
+/// 64 hex characters back to 32 bytes, None for anything else. The collector
+/// has no hex dependency of its own and does not need one for eight lines.
+fn unhex(h: &str) -> Option<[u8; 32]> {
+    if h.len() != 64 || !h.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(h.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Host ids become filenames, so anything that could climb out of the data
@@ -991,9 +1180,8 @@ async fn ingest(
             // Still under this host's lock, take the index lock -- host then
             // merkle, never the reverse -- and release it immediately. Pure
             // in-memory work only.
-            app.merkle
-                .lock()
-                .await
+            let mut index = app.merkle.lock().await;
+            index
                 .batches
                 .entry(host.clone())
                 .or_default()
@@ -1008,6 +1196,14 @@ async fn ingest(
                     sealed_at: line.sealed_at,
                     line_offset,
                 });
+            // Queued for the next fleet-wide root. The chainhash is cached
+            // here so the sealer never needs this host's lock or its files.
+            index.pending.push(PendingBatch {
+                host: host.clone(),
+                batch_id,
+                chainhash,
+            });
+            drop(index);
         }
     }
 
@@ -1166,6 +1362,512 @@ async fn watch_for_silence(app: Arc<App>, silence_secs: i64) {
             save_state(&app.data_dir, &name, &state);
         }
     }
+}
+
+// ---------------------------------------------------------
+// The root sealer (server.md 2.7)
+// ---------------------------------------------------------
+
+/// How often the sealer wakes to check its triggers. Both triggers are
+/// coarse -- an interval in minutes, a batch count in the hundreds -- so a
+/// tick finer than this buys nothing but wakeups.
+const ROOT_TICK_SECS: u64 = 10;
+
+/// Seal every pending batch into one fleet-wide root, if either trigger is due.
+///
+/// Split out of the loop so tests can fire it directly instead of waiting on a
+/// tick. Returns the root_id sealed, or None when there was nothing to do.
+///
+/// The lock discipline is the whole correctness argument, and it is short:
+/// this function takes the INDEX lock and no other, ever. It never takes a
+/// host lock, which is what keeps it off the ingest path and the lock graph
+/// acyclic (see LOCK ORDER). Both critical sections are pure in-memory work;
+/// the hashing and the fsync happen with nothing held.
+async fn seal_once(app: &Arc<App>, interval_secs: u64, max_batches: usize) -> Option<u64> {
+    let (snapshot, root_id, prev_root) = {
+        let index = app.merkle.lock().await;
+        // A quiet fleet seals nothing. Empty roots would cost one blockchain
+        // transaction each to commit to no records at all.
+        if index.pending.is_empty() {
+            return None;
+        }
+        let due = index.pending.len() >= max_batches
+            || index.last_seal.elapsed().as_secs() >= interval_secs;
+        if !due {
+            return None;
+        }
+        (
+            index.pending.clone(),
+            index.next_root_id,
+            index.last_root.clone(),
+        )
+    };
+
+    // No lock held from here to the append. Ingest keeps running, and anything
+    // it seals meanwhile lands after this snapshot in `pending` and rolls into
+    // the next root.
+    let sealed_count = snapshot.len();
+    let mut sorted = snapshot;
+    sorted.sort_by(|a, b| a.host.cmp(&b.host).then(a.batch_id.cmp(&b.batch_id)));
+
+    // Hosts ascending, batches ascending within a host. This order IS the
+    // format: a verifier that sorts differently computes a different root and
+    // every proof issued against it fails.
+    let leaves: Vec<[u8; 32]> = sorted
+        .iter()
+        .map(|p| merkle::batch_leaf(&p.host, p.batch_id, &p.chainhash))
+        .collect();
+    let root = merkle::root(&leaves);
+
+    let mut covers: Vec<RootCover> = Vec::new();
+    for p in &sorted {
+        match covers.last_mut() {
+            Some(c) if c.host == p.host => {
+                c.batch_hi = p.batch_id;
+                c.chainhashes.push(hex_string(&p.chainhash));
+            }
+            _ => covers.push(RootCover {
+                host: p.host.clone(),
+                batch_lo: p.batch_id,
+                batch_hi: p.batch_id,
+                chainhashes: vec![hex_string(&p.chainhash)],
+            }),
+        }
+    }
+
+    let line = RootLine {
+        v: 1,
+        root_id,
+        sealed_at: Utc::now().to_rfc3339(),
+        root: hex_string(&root),
+        prev_root,
+        leaf_count: leaves.len() as u64,
+        covers,
+    };
+    let Ok(mut encoded) = serde_json::to_string(&line) else {
+        eprintln!("CRITICAL: could not serialize root {}", root_id);
+        return None;
+    };
+    encoded.push('\n');
+
+    let path = roots_path(&app.data_dir);
+    let written = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        let line_offset = f.metadata()?.len();
+        f.write_all(encoded.as_bytes())?;
+        f.sync_all()?;
+        Ok(line_offset)
+    })
+    .await;
+
+    let line_offset = match written {
+        Ok(Ok(offset)) => offset,
+        // Nothing was written, so `pending` is deliberately left alone: the
+        // same batches roll into the next attempt under the same root_id. A
+        // root that was never appended simply never existed, which is what
+        // makes retrying it safe rather than a double-commitment.
+        Ok(Err(e)) => {
+            eprintln!("CRITICAL: could not seal root {}: {}", root_id, e);
+            return None;
+        }
+        Err(join) => {
+            eprintln!("CRITICAL: root seal task for {} did not complete: {}", root_id, join);
+            return None;
+        }
+    };
+
+    let mut index = app.merkle.lock().await;
+    // Exactly the prefix that was snapshotted. Anything ingest appended while
+    // the lock was released sits after it and is untouched, so no batch is
+    // dropped and none lands in two roots.
+    let take = sealed_count.min(index.pending.len());
+    index.pending.drain(..take);
+    let still_pending = index.pending.len();
+    index.next_root_id = root_id.saturating_add(1);
+    index.last_root = line.root.clone();
+    index.last_seal = std::time::Instant::now();
+    index.roots.push(RootIndexEntry {
+        root_id,
+        sealed_at: line.sealed_at,
+        root: line.root,
+        line_offset,
+        covers: line
+            .covers
+            .into_iter()
+            .map(|c| (c.host, c.batch_lo, c.batch_hi))
+            .collect(),
+    });
+    drop(index);
+
+    eprintln!(
+        "sealed root {} over {} batch(es); {} queued since",
+        root_id, take, still_pending
+    );
+    Some(root_id)
+}
+
+/// Level 2: one periodic, fleet-wide root over every batch sealed since the
+/// last one. Runs alongside `watch_for_silence` and, like it, holds no lock
+/// across any I/O.
+async fn seal_roots(app: Arc<App>, interval_secs: u64, max_batches: usize) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(ROOT_TICK_SECS));
+    loop {
+        tick.tick().await;
+        seal_once(&app, interval_secs, max_batches).await;
+    }
+}
+
+// ---------------------------------------------------------
+// merkle-audit (server.md 2.9, step 6)
+// ---------------------------------------------------------
+//
+// Everything below re-derives commitments from stored bytes and nothing else.
+// No K0, no network, no in-memory index: an auditor who is handed a copy of the
+// data directory can run this and get the same answer the collector would.
+
+/// The leaf of one stored line, recomputed exactly as ingest computed it.
+///
+/// A record line commits to the agent's bytes only -- `sealed_payload ||
+/// raw(hash)` -- so a third party holding just the record can rebuild it. Every
+/// other line, including a record whose hash is not 32 raw bytes, commits to
+/// the exact bytes the collector wrote. Ingest makes the same choice in the
+/// same order; if these two ever disagree, every proof for the batch is wrong,
+/// which is what the acceptance tests pin.
+pub(crate) fn leaf_for_line(line: &str) -> [u8; 32] {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("record").cloned())
+        .and_then(|r| serde_json::from_value::<AgentLog>(r).ok())
+        .and_then(|rec| merkle::record_leaf(&rec))
+        .unwrap_or_else(|| merkle::marker_leaf(line.as_bytes()))
+}
+
+/// A batch's leaves, recomputed from the events bytes the batch names.
+///
+/// None when the range no longer reads at all -- which is itself a finding, and
+/// the caller reports it rather than treating it as an empty batch.
+pub(crate) fn batch_leaves_from_events(events: &[u8], b: &BatchLine) -> Option<Vec<[u8; 32]>> {
+    let slice = events.get(b.byte_start as usize..b.byte_end as usize)?;
+    let text = std::str::from_utf8(slice).ok()?;
+    Some(
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(leaf_for_line)
+            .collect(),
+    )
+}
+
+/// Level-2 leaves of a root, in the canonical order the root line already
+/// stores them in. None if any chainhash is not 64 hex characters.
+fn level2_leaves(covers: &[RootCover]) -> Option<Vec<[u8; 32]>> {
+    let mut leaves = Vec::new();
+    for c in covers {
+        for (i, h) in c.chainhashes.iter().enumerate() {
+            let chainhash = unhex(h)?;
+            leaves.push(merkle::batch_leaf(
+                &c.host,
+                c.batch_lo.saturating_add(i as u64),
+                &chainhash,
+            ));
+        }
+    }
+    Some(leaves)
+}
+
+#[derive(Default)]
+pub(crate) struct AuditReport {
+    /// (host, batches, committed lines).
+    rows: Vec<(String, u64, u64)>,
+    roots: u64,
+    /// One line per finding, in the order they were found. Empty means intact.
+    pub(crate) divergences: Vec<String>,
+}
+
+/// Recompute every commitment under `dir`; report what no longer matches.
+///
+/// Roots are always audited even when `only_host` is given: a root is
+/// fleet-wide and recomputes from the chainhashes in its own line, so checking
+/// it needs no host's files. Only the cross-check of those chainhashes against
+/// the batch files is limited to the hosts that were audited.
+pub(crate) fn audit(dir: &Path, only_host: Option<&str>) -> AuditReport {
+    let mut report = AuditReport::default();
+    let mut sealed: HashMap<(String, u64), String> = HashMap::new();
+
+    let hosts: Vec<String> = match only_host {
+        Some(h) => vec![h.to_string()],
+        None => {
+            let mut found: Vec<String> = std::fs::read_dir(dir.join("batches"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .strip_suffix(".ndjson")
+                        .map(str::to_string)
+                })
+                .collect();
+            found.sort();
+            found
+        }
+    };
+
+    for host in &hosts {
+        let events = std::fs::read(events_path(dir, host)).unwrap_or_default();
+        let raw = std::fs::read_to_string(batches_path(dir, host)).unwrap_or_default();
+
+        let mut batches: Vec<BatchLine> = Vec::new();
+        for (i, line) in raw.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<BatchLine>(line) {
+                Ok(b) => batches.push(b),
+                Err(e) => report.divergences.push(format!(
+                    "{}: batch line {} does not parse: {}",
+                    host,
+                    i + 1,
+                    e
+                )),
+            }
+        }
+
+        let mut prev = GENESIS_MAC.to_string();
+        let mut lines = 0u64;
+        for (i, b) in batches.iter().enumerate() {
+            let at = format!("{} batch {}", host, b.batch_id);
+            if b.batch_id != i as u64 {
+                report.divergences.push(format!(
+                    "{}: batch ids are not dense; expected {} at this position. A batch line \
+                     was deleted, reordered, or inserted.",
+                    at, i
+                ));
+            }
+            if b.host != *host {
+                report.divergences.push(format!(
+                    "{}: batch line claims host {:?}, but it is stored under {:?}",
+                    at, b.host, host
+                ));
+            }
+            if b.prev_chainhash != prev {
+                report.divergences.push(format!(
+                    "{}: prev_chainhash {} does not match the previous batch's chainhash {}. \
+                     The batch chain was cut.",
+                    at, b.prev_chainhash, prev
+                ));
+            }
+            prev = b.chainhash.clone();
+            sealed.insert((host.clone(), b.batch_id), b.chainhash.clone());
+
+            let Some(leaves) = batch_leaves_from_events(&events, b) else {
+                report.divergences.push(format!(
+                    "{}: the committed byte range {}..{} no longer reads from the events file. \
+                     Lines were removed or the file was truncated.",
+                    at, b.byte_start, b.byte_end
+                ));
+                continue;
+            };
+            lines = lines.saturating_add(leaves.len() as u64);
+
+            if leaves.len() != b.count as usize {
+                report.divergences.push(format!(
+                    "{}: the committed byte range now holds {} line(s), but the batch commits \
+                     to {}",
+                    at,
+                    leaves.len(),
+                    b.count
+                ));
+            }
+            if leaves.len() != b.leaves.len() {
+                report.divergences.push(format!(
+                    "{}: {} recomputed leaf/leaves against {} stored",
+                    at,
+                    leaves.len(),
+                    b.leaves.len()
+                ));
+            }
+            for (j, l) in leaves.iter().enumerate() {
+                let recomputed = hex_string(l);
+                match b.leaves.get(j) {
+                    Some(stored) if *stored == recomputed => {}
+                    Some(stored) => report.divergences.push(format!(
+                        "{}: leaf {} recomputes to {} but the commitment says {}. Those bytes \
+                         were altered after they were sealed.",
+                        at, j, recomputed, stored
+                    )),
+                    None => report.divergences.push(format!(
+                        "{}: leaf {} has no stored counterpart",
+                        at, j
+                    )),
+                }
+            }
+
+            let recomputed = hex_string(&merkle::root(&leaves));
+            if recomputed != b.chainhash {
+                report.divergences.push(format!(
+                    "{}: chainhash recomputes to {} but the batch line says {}",
+                    at, recomputed, b.chainhash
+                ));
+            }
+        }
+
+        report
+            .rows
+            .push((host.clone(), batches.len() as u64, lines));
+    }
+
+    // Roots. Each one recomputes from the chainhashes it carries, so this half
+    // stands on its own even if no host's files are present at all.
+    let raw = std::fs::read_to_string(roots_path(dir)).unwrap_or_default();
+    let mut prev_root = GENESIS_MAC.to_string();
+    let mut expected_id = 0u64;
+    for (i, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let r: RootLine = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(e) => {
+                report
+                    .divergences
+                    .push(format!("root line {} does not parse: {}", i + 1, e));
+                continue;
+            }
+        };
+        report.roots = report.roots.saturating_add(1);
+        let at = format!("root {}", r.root_id);
+
+        if r.root_id != expected_id {
+            report.divergences.push(format!(
+                "{}: root ids are not dense; expected {} at this position. A root line was \
+                 deleted, and every batch it covered now has no covering root.",
+                at, expected_id
+            ));
+        }
+        expected_id = r.root_id.saturating_add(1);
+
+        if r.prev_root != prev_root {
+            report.divergences.push(format!(
+                "{}: prev_root {} does not match the previous root {}. The root chain was cut.",
+                at, r.prev_root, prev_root
+            ));
+        }
+        prev_root = r.root.clone();
+
+        // The canonical order is part of the format: hosts ascending, batches
+        // ascending within a host. A root written in any other order is one no
+        // independent verifier can reproduce.
+        if r.covers.windows(2).any(|w| match w {
+            [a, b] => a.host >= b.host,
+            _ => false,
+        }) {
+            report.divergences.push(format!(
+                "{}: covers is not sorted by host ascending, so the level-2 leaf order cannot \
+                 be reproduced by a verifier",
+                at
+            ));
+        }
+        let mut counted = 0u64;
+        for c in &r.covers {
+            let span = c.batch_hi.saturating_sub(c.batch_lo).saturating_add(1);
+            if c.chainhashes.len() as u64 != span {
+                report.divergences.push(format!(
+                    "{}: {} covers batches {}..={} ({}) but carries {} chainhash(es)",
+                    at,
+                    c.host,
+                    c.batch_lo,
+                    c.batch_hi,
+                    span,
+                    c.chainhashes.len()
+                ));
+            }
+            counted = counted.saturating_add(c.chainhashes.len() as u64);
+            for (j, h) in c.chainhashes.iter().enumerate() {
+                let batch_id = c.batch_lo.saturating_add(j as u64);
+                if let Some(stored) = sealed.get(&(c.host.clone(), batch_id)) {
+                    if stored != h {
+                        report.divergences.push(format!(
+                            "{}: covers {} batch {} with chainhash {}, but that batch line says \
+                             {}",
+                            at, c.host, batch_id, h, stored
+                        ));
+                    }
+                }
+            }
+        }
+        if counted != r.leaf_count {
+            report.divergences.push(format!(
+                "{}: leaf_count says {} but covers holds {}",
+                at, r.leaf_count, counted
+            ));
+        }
+
+        let Some(leaves) = level2_leaves(&r.covers) else {
+            report.divergences.push(format!(
+                "{}: a chainhash in covers is not 64 hex characters, so the root cannot be \
+                 recomputed",
+                at
+            ));
+            continue;
+        };
+        let recomputed = hex_string(&merkle::root(&leaves));
+        if recomputed != r.root {
+            report.divergences.push(format!(
+                "{}: recomputes to {} but the root line says {}",
+                at, recomputed, r.root
+            ));
+        }
+    }
+
+    report
+}
+
+fn cmd_merkle_audit(dir: &Path, host: Option<&str>) -> Result<(), anyhow::Error> {
+    if let Some(h) = host {
+        if !valid_host_id(h) {
+            anyhow::bail!("host id may only contain letters, digits, '-', '.', '_'");
+        }
+    }
+    let report = audit(dir, host);
+
+    for finding in &report.divergences {
+        println!("{}", finding);
+    }
+    if !report.divergences.is_empty() {
+        println!();
+    }
+
+    println!("{:<24} {:>8} {:>10}", "HOST", "BATCHES", "LINES");
+    let mut batches = 0u64;
+    let mut lines = 0u64;
+    for (h, b, l) in &report.rows {
+        println!("{:<24} {:>8} {:>10}", h, b, l);
+        batches = batches.saturating_add(*b);
+        lines = lines.saturating_add(*l);
+    }
+
+    println!();
+    println!("hosts         {}", report.rows.len());
+    println!("batches       {}", batches);
+    println!("lines         {}", lines);
+    println!("roots         {}", report.roots);
+    println!("divergences   {}", report.divergences.len());
+    if report.divergences.is_empty() {
+        println!("RESULT        intact");
+    } else {
+        println!("RESULT        TAMPERED. The store no longer matches its own commitments.");
+    }
+    println!();
+    println!("This checks the collector against ITS OWN commitments, with no K0 and no chain.");
+    println!("It does not prove the records are authentic (that is the HMAC under K0), and it");
+    println!("cannot see a record that was dropped before it was ever batched.");
+    Ok(())
 }
 
 // ---------------------------------------------------------
@@ -1381,11 +2083,15 @@ async fn main() -> Result<(), anyhow::Error> {
 
         Command::Status => cmd_status(&cli.data_dir),
 
+        Command::MerkleAudit { host } => cmd_merkle_audit(&cli.data_dir, host.as_deref()),
+
         Command::Serve {
             listen,
             silence_secs,
             max_concurrent_ingest,
             merkle,
+            root_interval_secs,
+            root_max_batches,
             dashboard_listen,
         } => {
             std::fs::create_dir_all(cli.data_dir.join("hosts"))?;
@@ -1394,7 +2100,14 @@ async fn main() -> Result<(), anyhow::Error> {
             // A zero here would wedge ingest permanently, so it is floored.
             let permits = max_concurrent_ingest.max(1);
             let app = Arc::new(App::with_merkle(cli.data_dir.clone(), permits, merkle));
-            let indexed: usize = app.merkle.lock().await.batches.values().map(Vec::len).sum();
+            let (indexed, rooted, pending) = {
+                let index = app.merkle.lock().await;
+                (
+                    index.batches.values().map(Vec::len).sum::<usize>(),
+                    index.roots.len(),
+                    index.pending.len(),
+                )
+            };
 
             // Warm the registry so `status` and silence detection see hosts
             // that have not reported since this process started.
@@ -1427,6 +2140,16 @@ async fn main() -> Result<(), anyhow::Error> {
 
             tokio::spawn(watch_for_silence(Arc::clone(&app), silence_secs));
 
+            // A zero here would seal a root per tick over a single batch, which
+            // is one blockchain transaction per ten seconds.
+            if merkle {
+                tokio::spawn(seal_roots(
+                    Arc::clone(&app),
+                    root_interval_secs,
+                    root_max_batches.max(1),
+                ));
+            }
+
             // Dashboard on its own socket. Bound before the ingest listener so
             // a typo'd bind address fails fast instead of after agents have
             // started delivering.
@@ -1456,13 +2179,15 @@ async fn main() -> Result<(), anyhow::Error> {
             let listener = tokio::net::TcpListener::bind(&listen).await?;
             eprintln!(
                 "edr-collector listening on {} | {} host(s) enrolled | data {:?} | \
-                 {} concurrent ingest | merkle {} ({} batches indexed)",
+                 {} concurrent ingest | merkle {} ({} batches, {} roots, {} pending)",
                 listen,
                 enrolled,
                 cli.data_dir,
                 permits,
                 if merkle { "on" } else { "off" },
-                indexed
+                indexed,
+                rooted,
+                pending
             );
             eprintln!(
                 "NOTE: plain HTTP. Terminate TLS in front of this and bind it to localhost."
@@ -2075,21 +2800,6 @@ pub(crate) mod merkle_batch_tests {
     use super::concurrency_tests::*;
     use super::*;
 
-    /// 64 hex chars back to 32 bytes. The collector has no hex dependency of
-    /// its own and does not need one for four lines of test code.
-    fn unhex(h: &str) -> [u8; 32] {
-        let bytes = h.as_bytes();
-        assert_eq!(bytes.len(), 64, "a leaf hash is 64 hex chars: {:?}", h);
-        let mut out = [0u8; 32];
-        for (i, slot) in out.iter_mut().enumerate() {
-            let Some(pair) = h.get(i * 2..i * 2 + 2) else {
-                panic!("hex pair {}", i)
-            };
-            *slot = u8::from_str_radix(pair, 16).unwrap_or_else(|e| panic!("hex: {}", e));
-        }
-        out
-    }
-
     /// Every batch line a host has sealed.
     pub(crate) fn batch_lines(dir: &Path, host: &str) -> Vec<BatchLine> {
         let raw = std::fs::read_to_string(batches_path(dir, host)).unwrap_or_default();
@@ -2105,29 +2815,12 @@ pub(crate) mod merkle_batch_tests {
     /// file over the batch's own byte range, recompute every leaf from those
     /// bytes, and rebuild the chainhash. It is `merkle-audit` in miniature, and
     /// it is what catches a leaf that was pushed out of step with its line.
-    /// Recompute a batch's leaves from the events bytes it names. Pure -- it
-    /// asserts nothing, so a tampered store yields different leaves rather
-    /// than a panic. Returns None if the range is no longer readable at all.
+    /// Recompute a batch's leaves from the events bytes it names, through the
+    /// same code `merkle-audit` uses. Pure -- it asserts nothing, so a tampered
+    /// store yields different leaves rather than a panic.
     pub(crate) fn recompute_leaves(dir: &Path, host: &str, b: &BatchLine) -> Option<Vec<[u8; 32]>> {
         let raw = std::fs::read(events_path(dir, host)).ok()?;
-        let slice = raw.get(b.byte_start as usize..b.byte_end as usize)?;
-        let text = std::str::from_utf8(slice).ok()?;
-
-        let mut leaves = Vec::new();
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            let v: serde_json::Value = serde_json::from_str(line).ok()?;
-            let leaf = match v.get("record") {
-                Some(rec) => match serde_json::from_value::<AgentLog>(rec.clone()) {
-                    Ok(parsed) => merkle::record_leaf(&parsed)
-                        .unwrap_or_else(|| merkle::marker_leaf(line.as_bytes())),
-                    Err(_) => merkle::marker_leaf(line.as_bytes()),
-                },
-                // A marker's leaf is over the exact bytes the collector wrote.
-                None => merkle::marker_leaf(line.as_bytes()),
-            };
-            leaves.push(leaf);
-        }
-        Some(leaves)
+        batch_leaves_from_events(&raw, b)
     }
 
     /// Chainhash of batch `id` as the events file stands now. Differs from the
@@ -2261,7 +2954,7 @@ pub(crate) mod merkle_batch_tests {
         let leaves: Vec<[u8; 32]> = b
             .leaves
             .iter()
-            .map(|h| unhex(h))
+            .map(|h| unhex(h).unwrap_or_else(|| panic!("leaf hex {:?}", h)))
             .collect();
         let root = merkle::root(&leaves);
         assert_eq!(hex_string(&root), b.chainhash);
@@ -2503,5 +3196,485 @@ mod tamper_tests {
             second.prev_chainhash, first.chainhash,
             "removing a batch line left the chain looking intact"
         );
+    }
+}
+
+
+// ---------------------------------------------------------
+// Root sealing (server.md 2.7, step 7)
+// ---------------------------------------------------------
+#[cfg(test)]
+mod root_tests {
+    use super::concurrency_tests::*;
+    use super::*;
+
+    /// Seal immediately: one pending batch is already >= the trigger.
+    const NOW: usize = 1;
+    /// Never on the count trigger, so only the interval can fire.
+    const NEVER: usize = usize::MAX;
+
+    fn root_lines(dir: &Path) -> Vec<RootLine> {
+        let raw = std::fs::read_to_string(roots_path(dir)).unwrap_or_default();
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("root line {:?}: {}", l, e)))
+            .collect()
+    }
+
+    async fn ingest_one(app: &Arc<App>, host: &str, k0: &[u8; 32], from_seq: u64, prev: &str) -> String {
+        let (body, next) = batch(k0, from_seq, 3, prev);
+        assert_eq!(post_batch(app, host, body).await, StatusCode::OK);
+        next
+    }
+
+    /// A quiet fleet must seal nothing. An empty root is a blockchain
+    /// transaction that commits to no records at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_fleet_seals_nothing() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        assert!(seal_once(&app, 0, NOW).await.is_none());
+        assert!(!roots_path(&dir.0).exists(), "no pending batches, no root file");
+    }
+
+    /// Both triggers, and only when they are due.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_root_seals_on_the_count_trigger_and_on_the_interval() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [41u8; 32];
+        enroll_for_test(&dir.0, "web-01", &k0);
+
+        let prev = ingest_one(&app, "web-01", &k0, 1, GENESIS_MAC).await;
+
+        // Neither trigger: one pending batch, a count threshold it cannot
+        // reach, and an interval that has not elapsed.
+        assert!(seal_once(&app, 3600, NEVER).await.is_none());
+        assert_eq!(app.merkle.lock().await.pending.len(), 1);
+
+        // Count trigger.
+        assert_eq!(seal_once(&app, 3600, NOW).await, Some(0));
+        assert!(app.merkle.lock().await.pending.is_empty());
+
+        // Interval trigger: a zero interval is always elapsed.
+        ingest_one(&app, "web-01", &k0, 4, &prev).await;
+        assert_eq!(seal_once(&app, 0, NEVER).await, Some(1));
+
+        let roots = root_lines(&dir.0);
+        assert_eq!(roots.len(), 2, "one root per seal, and only when due");
+    }
+
+    /// prev_root chains roots the way prev_chainhash chains batches, so a
+    /// deleted root line is visible without consulting the chain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn roots_chain_through_prev_root() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [42u8; 32];
+        enroll_for_test(&dir.0, "web-01", &k0);
+
+        let mut prev = GENESIS_MAC.to_string();
+        for i in 0..3u64 {
+            prev = ingest_one(&app, "web-01", &k0, i * 3 + 1, &prev).await;
+            assert_eq!(seal_once(&app, 0, NOW).await, Some(i));
+        }
+
+        let roots = root_lines(&dir.0);
+        assert_eq!(roots.len(), 3);
+        let mut expect = GENESIS_MAC.to_string();
+        for (i, r) in roots.iter().enumerate() {
+            assert_eq!(r.root_id, i as u64, "root ids are dense from 0");
+            assert_eq!(r.prev_root, expect, "root {} does not chain", i);
+            expect = r.root.clone();
+        }
+    }
+
+    /// The level-2 leaf order is part of the format: hosts ascending, batches
+    /// ascending within a host. A verifier that sorts differently computes a
+    /// different root and every proof fails, so the written order is pinned
+    /// here and the root is rebuilt from it independently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_root_is_built_in_canonical_order() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let k0 = [43u8; 32];
+        // Enrolled and ingested in reverse alphabetical order on purpose.
+        for host in ["z-host", "m-host", "a-host"] {
+            enroll_for_test(&dir.0, host, &k0);
+            let mut prev = GENESIS_MAC.to_string();
+            for b in 0..2u64 {
+                prev = ingest_one(&app, host, &k0, b * 3 + 1, &prev).await;
+            }
+        }
+        assert_eq!(seal_once(&app, 0, NOW).await, Some(0));
+
+        let roots = root_lines(&dir.0);
+        let Some(r) = roots.first() else { panic!("one root") };
+        let hosts: Vec<&str> = r.covers.iter().map(|c| c.host.as_str()).collect();
+        assert_eq!(hosts, vec!["a-host", "m-host", "z-host"]);
+        assert_eq!(r.leaf_count, 6);
+        for c in &r.covers {
+            assert_eq!((c.batch_lo, c.batch_hi), (0, 1));
+            assert_eq!(c.chainhashes.len(), 2);
+        }
+
+        // Rebuilt from the line alone, as a third party would.
+        let mut leaves = Vec::new();
+        for c in &r.covers {
+            for (i, h) in c.chainhashes.iter().enumerate() {
+                let chain = unhex(h).unwrap_or_else(|| panic!("chainhash hex"));
+                leaves.push(merkle::batch_leaf(&c.host, c.batch_lo + i as u64, &chain));
+            }
+        }
+        assert_eq!(hex_string(&merkle::root(&leaves)), r.root);
+
+        // And every leaf is provable against the root without K0.
+        let root = merkle::root(&leaves);
+        for (i, leaf) in leaves.iter().enumerate() {
+            let path = merkle::path(&leaves, i).unwrap_or_else(|| panic!("path {}", i));
+            assert!(merkle::verify_path(*leaf, i, leaves.len(), &path, root));
+        }
+    }
+
+    /// Sealing while agents keep POSTing must lose no batch and double-count
+    /// none. The sealer releases the index lock across its fsync, so anything
+    /// ingest queues meanwhile has to survive into the next root.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sealing_under_concurrent_ingest_loses_no_batch() {
+        let dir = temp_dir();
+        let app = Arc::new(App::new(dir.0.clone(), 32));
+        let k0 = [44u8; 32];
+
+        const HOSTS: u64 = 8;
+        const BATCHES: u64 = 6;
+        for h in 0..HOSTS {
+            enroll_for_test(&dir.0, &format!("host-{:02}", h), &k0);
+        }
+
+        let sealer = {
+            let app = Arc::clone(&app);
+            tokio::spawn(async move {
+                for _ in 0..40 {
+                    seal_once(&app, 0, NOW).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            })
+        };
+
+        let mut posting = Vec::new();
+        for h in 0..HOSTS {
+            let app = Arc::clone(&app);
+            posting.push(tokio::spawn(async move {
+                let host = format!("host-{:02}", h);
+                let mut prev = GENESIS_MAC.to_string();
+                for b in 0..BATCHES {
+                    let (body, next) = batch(&k0, b * 3 + 1, 3, &prev);
+                    prev = next;
+                    assert_eq!(post_batch(&app, &host, body).await, StatusCode::OK);
+                }
+            }));
+        }
+        let guarded = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            for t in posting {
+                t.await.unwrap_or_else(|e| panic!("poster: {}", e));
+            }
+            sealer.await.unwrap_or_else(|e| panic!("sealer: {}", e));
+        })
+        .await;
+        assert!(guarded.is_ok(), "a lock inversion would hang here");
+
+        // Drain whatever was still queued when the sealer stopped.
+        while seal_once(&app, 0, NOW).await.is_some() {}
+        assert!(app.merkle.lock().await.pending.is_empty());
+
+        let mut seen: HashMap<String, Vec<u64>> = HashMap::new();
+        for r in root_lines(&dir.0) {
+            for c in &r.covers {
+                for id in c.batch_lo..=c.batch_hi {
+                    seen.entry(c.host.clone()).or_default().push(id);
+                }
+            }
+        }
+        for h in 0..HOSTS {
+            let host = format!("host-{:02}", h);
+            let mut ids = seen.remove(&host).unwrap_or_default();
+            ids.sort_unstable();
+            let before = ids.len();
+            ids.dedup();
+            assert_eq!(before, ids.len(), "{} has a batch in two roots", host);
+            assert_eq!(
+                ids,
+                (0..BATCHES).collect::<Vec<u64>>(),
+                "{} is missing a batch from every root",
+                host
+            );
+        }
+    }
+
+    /// The pending queue survives a restart: a batch sealed but not yet rooted
+    /// before the process died is still rooted after it comes back, and one
+    /// already covered is not rooted twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_batches_are_rebuilt_from_disk_at_startup() {
+        let dir = temp_dir();
+        let k0 = [45u8; 32];
+        enroll_for_test(&dir.0, "web-01", &k0);
+
+        let prev = {
+            let app = Arc::new(App::new(dir.0.clone(), 8));
+            let prev = ingest_one(&app, "web-01", &k0, 1, GENESIS_MAC).await;
+            assert_eq!(seal_once(&app, 0, NOW).await, Some(0));
+            // Sealed but not rooted when the process goes away.
+            ingest_one(&app, "web-01", &k0, 4, &prev).await
+        };
+
+        let restarted = Arc::new(App::new(dir.0.clone(), 8));
+        {
+            let index = restarted.merkle.lock().await;
+            assert_eq!(index.next_root_id, 1, "root ids continue where they left off");
+            assert_eq!(index.pending.len(), 1, "batch 0 is rooted, batch 1 is not");
+            let Some(p) = index.pending.first() else { panic!("pending") };
+            assert_eq!((p.host.as_str(), p.batch_id), ("web-01", 1));
+        }
+
+        let _ = ingest_one(&restarted, "web-01", &k0, 7, &prev).await;
+        assert_eq!(seal_once(&restarted, 0, NOW).await, Some(1));
+
+        let roots = root_lines(&dir.0);
+        assert_eq!(roots.len(), 2);
+        let Some(second) = roots.get(1) else { panic!("second root") };
+        let Some(cover) = second.covers.first() else { panic!("cover") };
+        assert_eq!(
+            (cover.batch_lo, cover.batch_hi),
+            (1, 2),
+            "the batch sealed before the restart must still be rooted, exactly once"
+        );
+        assert_eq!(audit(&dir.0, None).divergences, Vec::<String>::new());
+    }
+}
+
+// ---------------------------------------------------------
+// merkle-audit (server.md 2.9, step 6)
+// ---------------------------------------------------------
+#[cfg(test)]
+mod audit_tests {
+    use super::concurrency_tests::*;
+    use super::merkle_batch_tests::*;
+    use super::*;
+
+    /// `n` batches for one host, then a root over them.
+    async fn store(dir: &Path, host: &str, k0: &[u8; 32], n: u64) {
+        let app = Arc::new(App::new(dir.to_path_buf(), 8));
+        enroll_for_test(dir, host, k0);
+        let mut prev = GENESIS_MAC.to_string();
+        for b in 0..n {
+            let (body, next) = batch(k0, b * 4 + 1, 4, &prev);
+            prev = next;
+            assert_eq!(post_batch(&app, host, body).await, StatusCode::OK);
+        }
+        assert!(seal_once(&app, 0, 1).await.is_some(), "the batches must root");
+    }
+
+    fn assert_intact(dir: &Path) {
+        let report = audit(dir, None);
+        assert_eq!(report.divergences, Vec::<String>::new());
+    }
+
+    /// The finding must name the thing that broke, not merely be non-empty --
+    /// an auditor reads this output and acts on it.
+    fn assert_reports(dir: &Path, needle: &str) {
+        let report = audit(dir, None);
+        assert!(
+            report.divergences.iter().any(|d| d.contains(needle)),
+            "no divergence mentioning {:?}; got {:#?}",
+            needle,
+            report.divergences
+        );
+    }
+
+    /// Real data, untouched: every chainhash and every root recomputes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_untouched_store_audits_as_intact() {
+        let dir = temp_dir();
+        let k0 = [51u8; 32];
+        store(&dir.0, "web-01", &k0, 3).await;
+        store(&dir.0, "db-02", &k0, 2).await;
+
+        let report = audit(&dir.0, None);
+        assert_eq!(report.divergences, Vec::<String>::new());
+        assert_eq!(report.roots, 2);
+        assert_eq!(
+            report.rows,
+            vec![
+                ("db-02".to_string(), 2, 8),
+                ("web-01".to_string(), 3, 12),
+            ]
+        );
+        // Auditing one host still audits every root -- a root recomputes from
+        // its own line and needs no host's files.
+        assert_eq!(audit(&dir.0, Some("web-01")).roots, 2);
+    }
+
+    /// Editing one byte of a record must be reported, not smoothed over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn editing_one_byte_is_reported() {
+        let dir = temp_dir();
+        let k0 = [52u8; 32];
+        store(&dir.0, "victim", &k0, 2).await;
+        assert_intact(&dir.0);
+
+        let path = events_path(&dir.0, "victim");
+        let before = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}", e));
+        let after = before.replacen("\"process_name\":\"bash\"", "\"process_name\":\"bosh\"", 1);
+        assert_eq!(after.len(), before.len(), "same length keeps byte ranges aligned");
+        std::fs::write(&path, &after).unwrap_or_else(|e| panic!("{}", e));
+
+        assert_reports(&dir.0, "leaf 0 recomputes to");
+        assert_reports(&dir.0, "chainhash recomputes to");
+    }
+
+    /// A deleted record line shortens the committed range.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deleted_line_is_reported() {
+        let dir = temp_dir();
+        let k0 = [53u8; 32];
+        store(&dir.0, "gap", &k0, 2).await;
+
+        let path = events_path(&dir.0, "gap");
+        let before = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}", e));
+        let kept: Vec<&str> = before.lines().skip(1).collect();
+        std::fs::write(&path, kept.join("\n") + "\n").unwrap_or_else(|e| panic!("{}", e));
+
+        assert!(!audit(&dir.0, Some("gap")).divergences.is_empty());
+    }
+
+    /// A deleted batch line breaks prev_chainhash continuity, and the root
+    /// that covered it now names a batch that is not there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deleted_batch_line_is_reported() {
+        let dir = temp_dir();
+        let k0 = [54u8; 32];
+        store(&dir.0, "chained", &k0, 3).await;
+
+        let path = batches_path(&dir.0, "chained");
+        let before = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}", e));
+        let kept: Vec<&str> = before
+            .lines()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, l)| l)
+            .collect();
+        std::fs::write(&path, kept.join("\n") + "\n").unwrap_or_else(|e| panic!("{}", e));
+
+        assert_reports(&dir.0, "prev_chainhash");
+        assert_reports(&dir.0, "batch ids are not dense");
+    }
+
+    /// A deleted root line breaks prev_root continuity, and every batch it
+    /// covered is left with no covering root. Report it loudly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deleted_root_line_is_reported() {
+        let dir = temp_dir();
+        let k0 = [55u8; 32];
+        enroll_for_test(&dir.0, "web-01", &k0);
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+        let mut prev = GENESIS_MAC.to_string();
+        for b in 0..3u64 {
+            let (body, next) = batch(&k0, b * 3 + 1, 3, &prev);
+            prev = next;
+            assert_eq!(post_batch(&app, "web-01", body).await, StatusCode::OK);
+            assert_eq!(seal_once(&app, 0, 1).await, Some(b));
+        }
+        assert_intact(&dir.0);
+
+        let path = roots_path(&dir.0);
+        let before = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}", e));
+        let kept: Vec<&str> = before
+            .lines()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, l)| l)
+            .collect();
+        std::fs::write(&path, kept.join("\n") + "\n").unwrap_or_else(|e| panic!("{}", e));
+
+        assert_reports(&dir.0, "root ids are not dense");
+        assert_reports(&dir.0, "prev_root");
+    }
+
+    /// Rewriting a root's own hash is caught by recomputation, even though
+    /// every batch it covers is untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rewritten_root_is_reported() {
+        let dir = temp_dir();
+        let k0 = [56u8; 32];
+        store(&dir.0, "web-01", &k0, 2).await;
+
+        let path = roots_path(&dir.0);
+        let before = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}", e));
+        let mut r: RootLine = serde_json::from_str(before.trim()).unwrap_or_else(|e| panic!("{}", e));
+        r.root = "00".repeat(32);
+        let mut line = serde_json::to_string(&r).unwrap_or_else(|e| panic!("{}", e));
+        line.push('\n');
+        std::fs::write(&path, line).unwrap_or_else(|e| panic!("{}", e));
+
+        assert_reports(&dir.0, "recomputes to");
+    }
+
+    /// Swapping a chainhash inside a root is caught two ways: the root no
+    /// longer recomputes, and the batch line disagrees with what the root says
+    /// it sealed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_swapped_chainhash_in_a_root_is_reported() {
+        let dir = temp_dir();
+        let k0 = [57u8; 32];
+        store(&dir.0, "web-01", &k0, 2).await;
+
+        let path = roots_path(&dir.0);
+        let before = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}", e));
+        let mut r: RootLine = serde_json::from_str(before.trim()).unwrap_or_else(|e| panic!("{}", e));
+        let Some(cover) = r.covers.first_mut() else { panic!("cover") };
+        cover.chainhashes.swap(0, 1);
+        let mut line = serde_json::to_string(&r).unwrap_or_else(|e| panic!("{}", e));
+        line.push('\n');
+        std::fs::write(&path, line).unwrap_or_else(|e| panic!("{}", e));
+
+        assert_reports(&dir.0, "but that batch line says");
+        assert_reports(&dir.0, "recomputes to");
+    }
+
+    /// A CHAIN_BREAK marker is a committed leaf, so it audits like any other
+    /// line -- deleting it later would otherwise be invisible.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_committed_marker_audits_and_cannot_be_removed_quietly() {
+        let dir = temp_dir();
+        let k0 = [58u8; 32];
+        enroll_for_test(&dir.0, "broken", &k0);
+        let app = Arc::new(App::new(dir.0.clone(), 8));
+
+        let (body, _) = batch(&k0, 1, 2, GENESIS_MAC);
+        assert_eq!(post_batch(&app, "broken", body).await, StatusCode::OK);
+        // A record that does not chain: the collector writes a CHAIN_BREAK
+        // marker before it, and both are committed.
+        let forged = seal_one(&k0, 3, &"aa".repeat(32));
+        let body = serde_json::to_string(&forged).unwrap_or_else(|e| panic!("{}", e)) + "\n";
+        assert_eq!(post_batch(&app, "broken", body).await, StatusCode::CONFLICT);
+        assert_eq!(seal_once(&app, 0, 1).await, Some(0));
+        assert_intact(&dir.0);
+
+        let batches = batch_lines(&dir.0, "broken");
+        let Some(b) = batches.get(1) else { panic!("second batch") };
+        assert_eq!(b.count, 2, "the marker is committed alongside the record");
+
+        // Remove the marker line and nothing else.
+        let path = events_path(&dir.0, "broken");
+        let before = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}", e));
+        let kept: Vec<&str> = before
+            .lines()
+            .filter(|l| !l.contains("CHAIN_BREAK"))
+            .collect();
+        assert_eq!(kept.len(), before.lines().count() - 1, "one marker removed");
+        std::fs::write(&path, kept.join("\n") + "\n").unwrap_or_else(|e| panic!("{}", e));
+
+        assert!(!audit(&dir.0, None).divergences.is_empty());
     }
 }

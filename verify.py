@@ -59,6 +59,114 @@ def sealed_payload(log):
     return b"".join(_lp(log[f]) for f in SEALED_FIELDS)
 
 
+# ---------------------------------------------------------------------------
+# Merkle trees (RFC 6962 style)
+#
+# Mirrors protocol/src/merkle.rs exactly. Two properties do the security work
+# and both are easy to lose by accident:
+#
+#   * Domain separation. Leaves are prefixed 0x00/0x02/0x03 and internal nodes
+#     0x01, so no leaf preimage can be passed off as an internal node.
+#   * An odd node is PROMOTED, never duplicated. Bitcoin-style padding makes
+#     [a,b,c] and [a,b,c,c] hash identically (CVE-2012-2459), which would let a
+#     commitment cover a set of records that was never stored.
+#
+# selftest() asserts the same hex constants the Rust tests assert. Drift
+# between the two implementations is the failure mode in this feature that
+# costs the most to find any other way -- every proof verifies on one side and
+# fails on the other with no clue why -- and these constants are the cheap
+# catch for it.
+# ---------------------------------------------------------------------------
+
+TAG_RECORD = 0x00   # a record line stored in events/{host}.ndjson
+TAG_NODE = 0x01     # an internal node, never a leaf
+TAG_MARKER = 0x02   # a collector-authored marker (CHAIN_BREAK, BUILD_MISMATCH)
+TAG_BATCH = 0x03    # a batch chainhash, as a leaf of the fleet-wide root
+
+
+def _leaf(tag, data):
+    return hashlib.sha256(bytes([tag]) + data).digest()
+
+
+def _node(left, right):
+    return hashlib.sha256(bytes([TAG_NODE]) + left + right).digest()
+
+
+def _largest_pow2_below(n):
+    """The largest power of two strictly less than n, for n > 1.
+
+    This split -- rather than a balanced halving -- is what makes the tree
+    shape depend only on n, so a verifier who knows the leaf count can rebuild
+    the shape without being told it.
+    """
+    if n < 2:
+        return 0
+    return 1 << ((n - 1).bit_length() - 1)
+
+
+def merkle_root(leaves):
+    """Merkle Tree Hash over already-computed leaf hashes."""
+    if not leaves:
+        return hashlib.sha256(b"").digest()
+    if len(leaves) == 1:
+        return leaves[0]
+    k = _largest_pow2_below(len(leaves))
+    return _node(merkle_root(leaves[:k]), merkle_root(leaves[k:]))
+
+
+def merkle_path(leaves, index):
+    """Audit path for `index`, bottom-up: (sibling_hash, sibling_is_left).
+
+    None for an out-of-range index rather than an exception -- the index comes
+    out of a proof bundle someone else wrote.
+    """
+    n = len(leaves)
+    if not 0 <= index < n:
+        return None
+    if n == 1:
+        return []
+    k = _largest_pow2_below(n)
+    if index < k:
+        sub = merkle_path(leaves[:k], index)
+        return None if sub is None else sub + [(merkle_root(leaves[k:]), False)]
+    sub = merkle_path(leaves[k:], index - k)
+    return None if sub is None else sub + [(merkle_root(leaves[:k]), True)]
+
+
+def _replay(leaf, index, n, path):
+    if not 0 <= index < n:
+        return None
+    if n == 1:
+        # A single-leaf tree has an empty path. A non-empty one here means the
+        # path is longer than the shape allows.
+        return leaf if not path else None
+    if not path:
+        return None
+    sibling, sibling_is_left = path[-1]
+    rest = path[:-1]
+    k = _largest_pow2_below(n)
+    if index < k:
+        if sibling_is_left:
+            return None
+        sub = _replay(leaf, index, k, rest)
+        return None if sub is None else _node(sub, sibling)
+    if not sibling_is_left:
+        return None
+    sub = _replay(leaf, index - k, n - k, rest)
+    return None if sub is None else _node(sibling, sub)
+
+
+def verify_path(leaf, index, n, path, root):
+    """Replay an audit path from a leaf to a claimed root.
+
+    `n` is required, not inferred: the tree shape depends on it, and letting a
+    verifier guess would let a path built over one shape be replayed against
+    another.
+    """
+    computed = _replay(leaf, index, n, list(path))
+    return computed is not None and hmac.compare_digest(computed, root)
+
+
 class KeySchedule:
     """K_0 given, K_{n+1} = SHA256(K_n). One-way, so a key recovered from a
     compromised host says nothing about the epochs before it."""
@@ -318,8 +426,80 @@ def selftest():
     typed[3]["epoch"] = "not-a-number"
     check(typed, False, "a non-numeric epoch must be reported, not crash")
 
-    print("selftest passed: sealing, chaining, sequencing and key evolution all"
-          " behave as specified.")
+    merkle_selftest()
+
+    print("selftest passed: sealing, chaining, sequencing, key evolution and the"
+          " Merkle tree all behave as specified.")
+
+
+def merkle_selftest():
+    # Known-answer vectors over leaf(0x00, b"0") .. leaf(0x00, b"7").
+    #
+    # These hex constants are asserted identically by known_answer_vectors() in
+    # protocol/src/merkle.rs. If one side is edited and the other is not, this
+    # is where it shows up -- not three weeks later in a proof nobody can check.
+    leaves = [_leaf(TAG_RECORD, str(i).encode()) for i in range(8)]
+    for n, want in [
+        (0, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        (1, "db3426e878068d28d269b6c87172322ce5372b65756d0789001d34835f601c03"),
+        (2, "cb00989d94a569c0a678ae042b63dcd4625db96440517f37a6eb7976ea24ed4b"),
+        (3, "725d5230db68f557470dc35f1d8865813acd7ebb07ad152774141decbae71327"),
+        (4, "9f4a3fc20d4162dc37d4e23d907848731a76043ffff6d69288bf1abfbcff478e"),
+        (8, "3b85a9626c1ccb64c6b95ec7fa64888defe2cf12e39e77e10812ce5fcb9cb58e"),
+    ]:
+        got = merkle_root(leaves[:n]).hex()
+        assert got == want, f"merkle root over {n} leaves: {got} != {want}"
+
+    # CVE-2012-2459: an odd node is promoted, never duplicated. Under
+    # Bitcoin-style padding these two sets hash identically, so a commitment to
+    # [a,b,c] would also be a commitment to [a,b,c,c] -- a different set of
+    # records than the one that was actually stored. The padded root is pinned
+    # as a constant too, so both implementations agree on the same pair rather
+    # than merely agreeing that they differ.
+    padded = leaves[:3] + [leaves[2]]
+    assert merkle_root(padded).hex() == \
+        "31fa70897cc42c61d9f9f1cfd0c00aeb9a0f085a62d0ec7d10c63e7862ce13a7"
+    assert merkle_root(leaves[:3]) != merkle_root(padded)
+
+    # Tags keep leaves and internal nodes apart.
+    same = b"same bytes"
+    assert _leaf(TAG_RECORD, same) != _leaf(TAG_MARKER, same)
+    assert _leaf(TAG_RECORD, same) != _leaf(TAG_BATCH, same)
+    assert _node(leaves[0], leaves[1]) != _leaf(TAG_RECORD, leaves[0] + leaves[1])
+
+    # Round-trip over every tree size up to 17 and every leaf in it, matching
+    # every_path_verifies_for_n_up_to_17 in merkle.rs.
+    for n in range(1, 18):
+        subset = [_leaf(TAG_RECORD, struct.pack(">I", i)) for i in range(n)]
+        root = merkle_root(subset)
+        for i in range(n):
+            path = merkle_path(subset, i)
+            assert path is not None, f"path n={n} i={i}"
+            assert verify_path(subset[i], i, n, path, root), f"n={n} i={i}"
+
+            # Flipping one bit of any sibling must break it.
+            for j in range(len(path)):
+                bad = list(path)
+                h, side = bad[j]
+                bad[j] = (bytes([h[0] ^ 0x01]) + h[1:], side)
+                assert not verify_path(subset[i], i, n, bad, root), \
+                    f"tampered sibling {j} of leaf {i} went undetected (n={n})"
+
+            # A correct path replayed at the wrong index must fail.
+            for wrong in range(n):
+                if wrong != i:
+                    assert not verify_path(subset[i], wrong, n, path, root), \
+                        f"path for leaf {i} verified at index {wrong} (n={n})"
+
+    # A path from a shorter tree must not verify against a longer one.
+    four = merkle_path(leaves[:4], 1)
+    assert four is not None
+    assert not verify_path(leaves[1], 1, 8, four, merkle_root(leaves[:8]))
+    assert not verify_path(leaves[1], 1, 4, four, merkle_root(leaves[:8]))
+
+    # Out of range is None, not an exception.
+    assert merkle_path(leaves, 8) is None
+    assert merkle_path([], 0) is None
 
 
 def main():
